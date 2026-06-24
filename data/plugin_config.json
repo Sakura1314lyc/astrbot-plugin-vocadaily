@@ -1,0 +1,18 @@
+{
+  "bilibili": {
+    "description": "B站收藏夹配置 — 从指定收藏夹随机抓取术曲视频",
+    "media_id": "8745208",
+    "page_size": 20,
+    "cache_minutes": 30,
+    "timeout_seconds": 15
+  },
+  "push": {
+    "description": "定时推送配置",
+    "cron_hour": 12,
+    "cron_minute": 0,
+    "target_groups": [
+      "123456789",
+      "987654321"
+    ]
+  }
+}
