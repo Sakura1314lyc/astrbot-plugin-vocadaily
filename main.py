@@ -57,10 +57,6 @@ def load_plugin_config() -> dict:
         return json.load(f)
 
 
-def save_plugin_config(config: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-
 
 # ============================================================================
 # 数据库层
@@ -167,124 +163,115 @@ class SongDB:
 # B站 API 工具
 # ============================================================================
 class BiliAPI:
-    """封装 B站公开 API 调用"""
+    """封装 B站公开 API 调用（复用 session 减少连接开销）"""
 
     HEADERS = {
         "User-Agent": UA,
         "Referer": "https://www.bilibili.com/",
     }
 
+    _session: aiohttp.ClientSession | None = None
+
+    @classmethod
+    async def _get_session(cls) -> aiohttp.ClientSession:
+        """获取或创建共享 session，避免每次请求都建立新连接"""
+        if cls._session is None or cls._session.closed:
+            timeout = aiohttp.ClientTimeout(total=15)
+            cls._session = aiohttp.ClientSession(timeout=timeout, headers=cls.HEADERS)
+        return cls._session
+
+    @classmethod
+    async def close_session(cls) -> None:
+        """关闭共享 session（插件卸载时调用）"""
+        if cls._session and not cls._session.closed:
+            await cls._session.close()
+
     @classmethod
     async def get_video_info(cls, bvid: str) -> dict | None:
         """通过 BV 号获取视频信息 (cid, title, author, cover, duration)"""
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                BILI_VIEW_API,
-                params={"bvid": bvid},
-                headers=cls.HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json()
-                if data.get("code") != 0:
-                    return None
-                d = data["data"]
-                return {
-                    "bvid": bvid,
-                    "cid": d.get("cid", 0),
-                    "title": d.get("title", ""),
-                    "author": d.get("owner", {}).get("name", ""),
-                    "cover": d.get("pic", ""),
-                    "duration": d.get("duration", 0),
-                }
+        s = await cls._get_session()
+        async with s.get(BILI_VIEW_API, params={"bvid": bvid}) as resp:
+            data = await resp.json()
+            if data.get("code") != 0:
+                return None
+            d = data["data"]
+            return {
+                "bvid": bvid,
+                "cid": d.get("cid", 0),
+                "title": d.get("title", ""),
+                "author": d.get("owner", {}).get("name", ""),
+                "cover": d.get("pic", ""),
+                "duration": d.get("duration", 0),
+            }
 
     @classmethod
     async def get_play_url(cls, bvid: str, cid: int) -> str | None:
         """获取可下载的视频直链（MP4）。失败返回 None。"""
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                BILI_PLAYURL_API,
-                params={"bvid": bvid, "cid": cid, "qn": 80, "fnval": 1},
-                headers=cls.HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json()
-                if data.get("code") != 0:
-                    return None
-                durl = data.get("data", {}).get("durl", [])
-                if durl:
-                    return durl[0].get("url")
+        s = await cls._get_session()
+        async with s.get(
+            BILI_PLAYURL_API,
+            params={"bvid": bvid, "cid": cid, "qn": 80, "fnval": 1},
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != 0:
                 return None
+            durl = data.get("data", {}).get("durl", [])
+            if durl:
+                return durl[0].get("url")
+            return None
 
     @classmethod
-    async def fetch_fav_page(cls, media_id: str, page: int, page_size: int = 20) -> list[dict]:
-        """拉取收藏夹单页，返回 [{bvid, title}, ...]"""
-        async with aiohttp.ClientSession() as s:
-            params = {
-                "media_id": media_id,
-                "pn": page,
-                "ps": page_size,
-                "platform": "web",
-            }
-            async with s.get(
-                BILI_FAV_API,
-                params=params,
-                headers=cls.HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json()
-                if data.get("code") != 0:
-                    return []
-                medias = data.get("data", {}).get("medias") or []
-                results = []
-                for item in medias:
-                    bvid = item.get("bvid", "")
-                    title = item.get("title", "").strip()
-                    if bvid and title:
-                        results.append({"bvid": bvid, "title": title})
-                return results
-
-    @classmethod
-    async def fetch_fav_all(cls, media_id: str, page_size: int = 20) -> list[dict]:
-        """拉取整个收藏夹，返回 [{bvid, title}, ...]"""
-        # 先拉第一页获取总数
-        async with aiohttp.ClientSession() as s:
-            params = {
-                "media_id": media_id,
-                "pn": 1,
-                "ps": page_size,
-                "platform": "web",
-            }
-            async with s.get(
-                BILI_FAV_API, params=params, headers=cls.HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json()
-                if data.get("code") != 0:
-                    raise RuntimeError(f"收藏夹 API 错误: code={data.get('code')}")
-
-            info = data.get("data", {}).get("info", {})
-            total_pages = max(1, int(info.get("page_count", 1)))
-
-            # 收集第一页
-            all_videos: list[dict] = []
+    async def _fetch_fav_page(cls, media_id: str, page: int, page_size: int) -> list[dict]:
+        """拉取收藏夹单页（内部方法，使用共享 session）"""
+        s = await cls._get_session()
+        params = {"media_id": media_id, "pn": page, "ps": page_size, "platform": "web"}
+        async with s.get(BILI_FAV_API, params=params) as resp:
+            data = await resp.json()
+            if data.get("code") != 0:
+                return []
             medias = data.get("data", {}).get("medias") or []
+            results = []
             for item in medias:
                 bvid = item.get("bvid", "")
                 title = item.get("title", "").strip()
                 if bvid and title:
-                    all_videos.append({"bvid": bvid, "title": title})
+                    results.append({"bvid": bvid, "title": title})
+            return results
 
-            # 剩余页并发
-            if total_pages > 1:
-                tasks = []
-                for p in range(2, total_pages + 1):
-                    tasks.append(cls.fetch_fav_page(media_id, p, page_size))
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for r in results:
-                    if isinstance(r, list):
-                        all_videos.extend(r)
+    @classmethod
+    async def fetch_fav_all(cls, media_id: str, page_size: int = 20) -> list[dict]:
+        """拉取整个收藏夹，返回 [{bvid, title}, ...]"""
+        s = await cls._get_session()
+        params = {"media_id": media_id, "pn": 1, "ps": page_size, "platform": "web"}
+        async with s.get(BILI_FAV_API, params=params) as resp:
+            data = await resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"收藏夹 API 错误: code={data.get('code')}")
 
-            return all_videos
+        info = data.get("data", {}).get("info", {})
+        total_pages = max(1, int(info.get("page_count", 1)))
+
+        # 收集第一页
+        all_videos: list[dict] = []
+        medias = data.get("data", {}).get("medias") or []
+        for item in medias:
+            bvid = item.get("bvid", "")
+            title = item.get("title", "").strip()
+            if bvid and title:
+                all_videos.append({"bvid": bvid, "title": title})
+
+        # 剩余页并发
+        if total_pages > 1:
+            tasks = [
+                cls._fetch_fav_page(media_id, p, page_size)
+                for p in range(2, total_pages + 1)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, list):
+                    all_videos.extend(r)
+
+        return all_videos
 
 
 # ============================================================================
@@ -304,7 +291,6 @@ class JRSQPlugin(Star):
 
         self.media_id = str(bili_cfg.get("media_id", "8745208"))
         self.page_size = int(bili_cfg.get("page_size", 20))
-        self.timeout = int(bili_cfg.get("timeout_seconds", 15))
         self.target_groups = push_cfg.get("target_groups", [])
         cron_hour = push_cfg.get("cron_hour", 12)
         cron_minute = push_cfg.get("cron_minute", 0)
@@ -315,6 +301,16 @@ class JRSQPlugin(Star):
             self.scheduled_push, "cron", hour=cron_hour, minute=cron_minute
         )
         self.scheduler.start()
+
+    async def initialize(self) -> None:
+        """插件激活时初始化数据库"""
+        await self.db.init()
+        logger.info(f"[jrsq] 数据库已初始化，当前曲库 {await self.db.count()} 首")
+
+    async def terminate(self) -> None:
+        """插件卸载时清理资源"""
+        self.scheduler.shutdown(wait=False)
+        await BiliAPI.close_session()
 
     # ==================================================================
     # 核心：随机推荐（返回视频）
