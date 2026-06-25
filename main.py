@@ -1,35 +1,56 @@
+"""
+astrbot-plugin-vocadaily — 每日术曲推荐插件
+
+功能：
+  - 从 B站收藏夹同步曲库到本地 SQLite 数据库
+  - /jrsq          随机推荐一首术曲（发送视频 + 信息）
+  - /jrsq list     查看曲库列表（分页）
+  - /jrsq add      手动添加曲目（BV号）
+  - /jrsq del      删除曲目
+  - /jrsq search   按标题搜索
+  - /jrsq favsync  从收藏夹同步新曲目
+  - /jrsq count    查看曲库数量
+  - 每天定时推送
+"""
+
 import asyncio
 import json
 import logging
 import os
-import random
-import time
 
 import aiohttp
+import aiosqlite
 from astrbot.api.all import *
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logger = logging.getLogger("astrbot")
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-# ---------------------------------------------------------------------------
+# ============================================================================
 # 常量
-# ---------------------------------------------------------------------------
+# ============================================================================
+PLUGIN_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(PLUGIN_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "jrsq.db")
+CONFIG_PATH = os.path.join(DATA_DIR, "plugin_config.json")
+
+BILI_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
+BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl"
 BILI_FAV_API = "https://api.bilibili.com/x/v3/fav/resource/list"
 BILI_VIDEO_BASE = "https://www.bilibili.com/video/"
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "data", "plugin_config.json")
+
+os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# 配置加载
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 配置
+# ============================================================================
 def load_plugin_config() -> dict:
-    """加载插件配置文件，不存在则返回空字典"""
     if not os.path.exists(CONFIG_PATH):
         return {}
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -37,172 +58,258 @@ def load_plugin_config() -> dict:
 
 
 def save_plugin_config(config: dict) -> None:
-    """持久化插件配置文件"""
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
-# ---------------------------------------------------------------------------
-# B站收藏夹数据获取器
-# ---------------------------------------------------------------------------
-class BiliFavFetcher:
-    """
-    从 B站公开收藏夹拉取视频列表，并在内存中缓存。
-    使用方式：
-        fetcher = BiliFavFetcher(media_id="8745208", cache_minutes=30)
-        video = await fetcher.random_video()  # -> {"title": "...", "bvid": "..."}
-    """
+# ============================================================================
+# 数据库层
+# ============================================================================
+class SongDB:
+    """本地 SQLite 曲库"""
 
-    def __init__(
-        self,
-        media_id: str,
-        page_size: int = 20,
-        cache_minutes: int = 30,
-        timeout: int = 15,
-    ):
-        self.media_id = media_id
-        self.page_size = page_size
-        self.cache_minutes = cache_minutes
-        self.timeout = timeout
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
 
-        self._videos: list[dict] = []       # 内存缓存
-        self._last_fetch: float = 0.0       # 上次拉取时间戳
-        self._total_pages: int = 1          # 收藏夹总页数
-
-    # ------------------------------------------------------------------
-    # 底层 API 请求
-    # ------------------------------------------------------------------
-    async def _fetch_page(self, session: aiohttp.ClientSession, page: int) -> dict:
-        """请求单页收藏夹数据，返回解析后的 JSON。"""
-        params = {
-            "media_id": self.media_id,
-            "pn": page,
-            "ps": self.page_size,
-            "platform": "web",
-        }
-        headers = {
-            "User-Agent": UA,
-            "Referer": "https://www.bilibili.com/",
-        }
-        async with session.get(
-            BILI_FAV_API, params=params, headers=headers, timeout=self.timeout
-        ) as resp:
-            return await resp.json()
-
-    @staticmethod
-    def _parse_video(item: dict) -> dict | None:
-        """从 API 返回的单条数据中提取 title 和 bvid。"""
-        title = item.get("title", "")
-        bvid = item.get("bvid", "")
-        # 跳过已失效视频
-        if not title or not bvid:
-            return None
-        return {"title": title.strip(), "bvid": bvid}
-
-    # ------------------------------------------------------------------
-    # 拉取全部收藏夹
-    # ------------------------------------------------------------------
-    async def refresh_cache(self) -> None:
-        """全量拉取收藏夹视频并写入缓存。"""
-        async with aiohttp.ClientSession() as session:
-            # ① 先拉第一页，获取总页数
-            data = await self._fetch_page(session, 1)
-            code = data.get("code", -1)
-            if code != 0:
-                raise RuntimeError(
-                    f"B站 API 返回异常，code={code}, message={data.get('message', '')}"
+    async def init(self) -> None:
+        """初始化数据库表"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS songs (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bvid     TEXT    NOT NULL UNIQUE,
+                    cid      INTEGER NOT NULL,
+                    title    TEXT    NOT NULL,
+                    author   TEXT    DEFAULT '',
+                    cover    TEXT    DEFAULT '',
+                    duration INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+            await db.commit()
+
+    # ---- 增删改查 ----
+
+    async def add(self, bvid: str, cid: int, title: str,
+                  author: str = "", cover: str = "", duration: int = 0) -> bool:
+        """添加曲目，已存在则返回 False"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute(
+                    "INSERT INTO songs (bvid, cid, title, author, cover, duration) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (bvid, cid, title, author, cover, duration),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                return False
+
+    async def delete(self, song_id: int) -> bool:
+        """按 ID 删除"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("DELETE FROM songs WHERE id = ?", (song_id,))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def random(self) -> dict | None:
+        """随机返回一首"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM songs ORDER BY RANDOM() LIMIT 1")
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_all(self, page: int = 1, per_page: int = 10) -> tuple[list[dict], int]:
+        """分页列表，返回 (条目列表, 总条数)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # 总数
+            cur = await db.execute("SELECT COUNT(*) FROM songs")
+            total = (await cur.fetchone())[0]
+            # 分页
+            offset = (page - 1) * per_page
+            cur = await db.execute(
+                "SELECT * FROM songs ORDER BY id DESC LIMIT ? OFFSET ?",
+                (per_page, offset),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+            return rows, total
+
+    async def search(self, keyword: str, limit: int = 20) -> list[dict]:
+        """按标题模糊搜索"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM songs WHERE title LIKE ? ORDER BY id DESC LIMIT ?",
+                (f"%{keyword}%", limit),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def count(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM songs")
+            return (await cur.fetchone())[0]
+
+    async def has_bvid(self, bvid: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT 1 FROM songs WHERE bvid = ?", (bvid,))
+            return await cur.fetchone() is not None
+
+    async def get_all_bvids(self) -> set[str]:
+        """获取所有已存 BV 号（用于收藏夹同步去重）"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT bvid FROM songs")
+            return {r[0] for r in await cur.fetchall()}
+
+
+# ============================================================================
+# B站 API 工具
+# ============================================================================
+class BiliAPI:
+    """封装 B站公开 API 调用"""
+
+    HEADERS = {
+        "User-Agent": UA,
+        "Referer": "https://www.bilibili.com/",
+    }
+
+    @classmethod
+    async def get_video_info(cls, bvid: str) -> dict | None:
+        """通过 BV 号获取视频信息 (cid, title, author, cover, duration)"""
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                BILI_VIEW_API,
+                params={"bvid": bvid},
+                headers=cls.HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                if data.get("code") != 0:
+                    return None
+                d = data["data"]
+                return {
+                    "bvid": bvid,
+                    "cid": d.get("cid", 0),
+                    "title": d.get("title", ""),
+                    "author": d.get("owner", {}).get("name", ""),
+                    "cover": d.get("pic", ""),
+                    "duration": d.get("duration", 0),
+                }
+
+    @classmethod
+    async def get_play_url(cls, bvid: str, cid: int) -> str | None:
+        """获取可下载的视频直链（MP4）。失败返回 None。"""
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                BILI_PLAYURL_API,
+                params={"bvid": bvid, "cid": cid, "qn": 80, "fnval": 1},
+                headers=cls.HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                if data.get("code") != 0:
+                    return None
+                durl = data.get("data", {}).get("durl", [])
+                if durl:
+                    return durl[0].get("url")
+                return None
+
+    @classmethod
+    async def fetch_fav_page(cls, media_id: str, page: int, page_size: int = 20) -> list[dict]:
+        """拉取收藏夹单页，返回 [{bvid, title}, ...]"""
+        async with aiohttp.ClientSession() as s:
+            params = {
+                "media_id": media_id,
+                "pn": page,
+                "ps": page_size,
+                "platform": "web",
+            }
+            async with s.get(
+                BILI_FAV_API,
+                params=params,
+                headers=cls.HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                if data.get("code") != 0:
+                    return []
+                medias = data.get("data", {}).get("medias") or []
+                results = []
+                for item in medias:
+                    bvid = item.get("bvid", "")
+                    title = item.get("title", "").strip()
+                    if bvid and title:
+                        results.append({"bvid": bvid, "title": title})
+                return results
+
+    @classmethod
+    async def fetch_fav_all(cls, media_id: str, page_size: int = 20) -> list[dict]:
+        """拉取整个收藏夹，返回 [{bvid, title}, ...]"""
+        # 先拉第一页获取总数
+        async with aiohttp.ClientSession() as s:
+            params = {
+                "media_id": media_id,
+                "pn": 1,
+                "ps": page_size,
+                "platform": "web",
+            }
+            async with s.get(
+                BILI_FAV_API, params=params, headers=cls.HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                if data.get("code") != 0:
+                    raise RuntimeError(f"收藏夹 API 错误: code={data.get('code')}")
 
             info = data.get("data", {}).get("info", {})
-            self._total_pages = max(1, int(info.get("page_count", 1)))
+            total_pages = max(1, int(info.get("page_count", 1)))
 
-            # ② 解析第一页
-            videos: list[dict] = []
-            medias = data.get("data", {}).get("medias", []) or []
+            # 收集第一页
+            all_videos: list[dict] = []
+            medias = data.get("data", {}).get("medias") or []
             for item in medias:
-                v = self._parse_video(item)
-                if v:
-                    videos.append(v)
+                bvid = item.get("bvid", "")
+                title = item.get("title", "").strip()
+                if bvid and title:
+                    all_videos.append({"bvid": bvid, "title": title})
 
-            # ③ 如有剩余页，并发拉取
-            if self._total_pages > 1:
+            # 剩余页并发
+            if total_pages > 1:
                 tasks = []
-                for p in range(2, self._total_pages + 1):
-                    tasks.append(self._fetch_page(session, p))
+                for p in range(2, total_pages + 1):
+                    tasks.append(cls.fetch_fav_page(media_id, p, page_size))
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for r in results:
-                    if isinstance(r, Exception):
-                        # 单页失败不中断整体，记录日志
-                        logger.warning(f"[jrsq] 拉取收藏夹第页失败: {r}")
-                        continue
-                    if isinstance(r, dict):
-                        medias = r.get("data", {}).get("medias", []) or []
-                        for item in medias:
-                            v = self._parse_video(item)
-                            if v:
-                                videos.append(v)
+                    if isinstance(r, list):
+                        all_videos.extend(r)
 
-            self._videos = videos
-            self._last_fetch = time.time()
-            logger.info(f"[jrsq] 缓存已刷新，共 {len(self._videos)} 个视频")
-
-    # ------------------------------------------------------------------
-    # 公开接口
-    # ------------------------------------------------------------------
-    def is_cache_stale(self) -> bool:
-        """缓存是否过期。"""
-        if not self._videos:
-            return True
-        elapsed = time.time() - self._last_fetch
-        return elapsed > self.cache_minutes * 60
-
-    async def random_video(self) -> dict | None:
-        """随机返回一个视频，缓存过期时自动刷新。"""
-        if self.is_cache_stale():
-            await self.refresh_cache()
-        if not self._videos:
-            return None
-        return random.choice(self._videos)
-
-    async def get_video_count(self) -> int:
-        """返回缓存中的视频总数。"""
-        if self.is_cache_stale():
-            await self.refresh_cache()
-        return len(self._videos)
+            return all_videos
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # 插件主体
-# ---------------------------------------------------------------------------
-@register("jrsq", "sakura", "每日术曲推荐 — 从B站收藏夹随机推送术曲视频", "2.0.0")
+# ============================================================================
+@register("jrsq", "sakura", "每日术曲推荐 — B站术曲随机推送（视频消息）", "3.0.0")
 class JRSQPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
-        # ---------- 读取配置 ----------
+        self.db = SongDB(DB_PATH)
+
+        # ---- 读取配置 ----
         cfg = load_plugin_config()
         bili_cfg = cfg.get("bilibili", {})
         push_cfg = cfg.get("push", {})
 
-        media_id = bili_cfg.get("media_id", "8745208")
-        page_size = bili_cfg.get("page_size", 20)
-        cache_minutes = bili_cfg.get("cache_minutes", 30)
-        timeout = bili_cfg.get("timeout_seconds", 15)
-
-        self.fetcher = BiliFavFetcher(
-            media_id=str(media_id),
-            page_size=int(page_size),
-            cache_minutes=int(cache_minutes),
-            timeout=int(timeout),
-        )
-
-        # ---------- 推送配置 ----------
+        self.media_id = str(bili_cfg.get("media_id", "8745208"))
+        self.page_size = int(bili_cfg.get("page_size", 20))
+        self.timeout = int(bili_cfg.get("timeout_seconds", 15))
         self.target_groups = push_cfg.get("target_groups", [])
         cron_hour = push_cfg.get("cron_hour", 12)
         cron_minute = push_cfg.get("cron_minute", 0)
 
-        # ---------- 定时器 ----------
+        # ---- 定时器 ----
         self.scheduler = AsyncIOScheduler()
         self.scheduler.add_job(
             self.scheduled_push, "cron", hour=cron_hour, minute=cron_minute
@@ -210,50 +317,250 @@ class JRSQPlugin(Star):
         self.scheduler.start()
 
     # ==================================================================
-    # 数据层
+    # 核心：随机推荐（返回视频）
     # ==================================================================
-    async def get_shuju_data(self) -> str:
-        """从 B站收藏夹随机获取一首术曲，拼接为消息文本。"""
-        try:
-            video = await self.fetcher.random_video()
-        except Exception as e:
-            logger.error(f"[jrsq] 获取视频失败: {e}", exc_info=True)
-            return f"😢 获取术曲失败了，请稍后再试。\n({e})"
-
-        if video is None:
-            return "😢 收藏夹里还没有视频，请联系管理员添加曲目。"
-
-        return (
+    async def _build_video_message(self, song: dict) -> MessageChain:
+        """
+        根据曲目信息构建消息链：
+          - 文本：🎵 标题 + 作者
+          - 视频：从 B站直链下载的 MP4
+        失败时降级为纯文本 + 链接。
+        """
+        text = (
             f"🎵 今日术曲推荐：\n"
-            f"{video['title']}\n"
-            f"🔗 视频链接：{BILI_VIDEO_BASE}{video['bvid']}"
+            f"{song['title']}\n"
+            f"👤 UP主：{song.get('author', '未知')}"
         )
 
+        try:
+            play_url = await BiliAPI.get_play_url(song["bvid"], song["cid"])
+        except Exception:
+            play_url = None
+
+        if play_url:
+            try:
+                return MessageChain([
+                    Plain(text),
+                    Video.fromURL(play_url),
+                ])
+            except Exception as e:
+                logger.warning(f"[jrsq] 视频发送失败，降级为链接: {e}")
+
+        # 降级
+        return MessageChain([
+            Plain(text + f"\n🔗 {BILI_VIDEO_BASE}{song['bvid']}"),
+            Plain("\n⚠️ 视频直链获取失败，请点击链接观看"),
+        ])
+
     # ==================================================================
-    # 指令层
+    # 指令：/jrsq
     # ==================================================================
     @filter.command("jrsq")
-    async def handle_jrsq_command(self, event: AstrMessageEvent):
-        """处理 /jrsq 指令 — 手动触发每日术曲"""
-        result_msg = await self.get_shuju_data()
-        yield event.plain_result(result_msg)
-
-    @filter.command("jrsq_refresh")
-    async def handle_refresh_command(self, event: AstrMessageEvent):
-        """处理 /jrsq_refresh 指令 — 手动刷新缓存"""
+    async def cmd_random(self, event: AstrMessageEvent):
+        """随机推荐一首术曲"""
         try:
-            await self.fetcher.refresh_cache()
-            cnt = len(self.fetcher._videos)
-            yield event.plain_result(f"✅ 缓存已刷新，共 {cnt} 首曲目。")
+            song = await self.db.random()
+            if song is None:
+                yield event.plain_result("😢 曲库为空，请先用 /jrsq favsync 同步或 /jrsq add 添加曲目。")
+                return
+
+            msg = await self._build_video_message(song)
+            yield event.chain_result([msg])
         except Exception as e:
-            yield event.plain_result(f"😢 缓存刷新失败: {e}")
+            logger.error(f"[jrsq] 随机推荐异常: {e}", exc_info=True)
+            yield event.plain_result(f"😢 出了点问题: {e}")
 
-    @filter.command("jrsq_count")
-    async def handle_count_command(self, event: AstrMessageEvent):
-        """处理 /jrsq_count 指令 — 查看当前缓存的曲目数"""
+    # ==================================================================
+    # 指令：/jrsq list [页码]
+    # ==================================================================
+    @filter.command("jrsq list")
+    async def cmd_list(self, event: AstrMessageEvent):
+        """查看曲库列表（分页，每页 10 条）"""
         try:
-            cnt = await self.fetcher.get_video_count()
-            yield event.plain_result(f"📊 当前缓存曲目数: {cnt}")
+            msg = event.message_str.strip()
+            page = 1
+            # 尝试提取页码，如 "/jrsq list 2"
+            parts = msg.split()
+            if len(parts) >= 3:
+                try:
+                    page = max(1, int(parts[2]))
+                except ValueError:
+                    pass
+
+            songs, total = await self.db.list_all(page=page, per_page=10)
+            if not songs:
+                yield event.plain_result("😢 曲库为空。")
+                return
+
+            total_pages = (total + 9) // 10
+            lines = [f"📋 曲库列表 ({total}首) [第{page}/{total_pages}页]"]
+            for s in songs:
+                dur = s.get("duration", 0)
+                dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "??:??"
+                lines.append(
+                    f"  [{s['id']}] {s['title']}  |  {dur_str}  |  {s['bvid']}"
+                )
+            if page < total_pages:
+                lines.append(f"👉 输入 /jrsq list {page + 1} 查看下一页")
+
+            yield event.plain_result("\n".join(lines))
+        except Exception as e:
+            yield event.plain_result(f"😢 查询失败: {e}")
+
+    # ==================================================================
+    # 指令：/jrsq add <BV号>
+    # ==================================================================
+    @filter.command("jrsq add")
+    async def cmd_add(self, event: AstrMessageEvent):
+        """从 B站添加曲目，用法: /jrsq add BV1xx411c7m9"""
+        try:
+            parts = event.message_str.strip().split()
+            if len(parts) < 3:
+                yield event.plain_result("⚠️ 用法: /jrsq add <BV号>")
+                return
+
+            bvid = parts[2].strip()
+            if bvid.startswith("http"):
+                # 用户可能粘贴了完整链接
+                if "BV" in bvid:
+                    bvid = bvid[bvid.index("BV"):]
+                bvid = bvid.split("?")[0].split("/")[-1]
+
+            if not bvid.startswith("BV"):
+                yield event.plain_result("⚠️ 请输入有效的 BV 号（以 BV 开头）")
+                return
+
+            # 检查是否已存在
+            if await self.db.has_bvid(bvid):
+                yield event.plain_result(f"⚠️ {bvid} 已在曲库中。")
+                return
+
+            # 从 B站 获取详情
+            yield event.plain_result(f"🔍 正在获取 {bvid} 的信息...")
+
+            info = await BiliAPI.get_video_info(bvid)
+            if info is None:
+                yield event.plain_result(f"😢 无法获取 {bvid} 的信息，请检查 BV 号是否正确。")
+                return
+
+            await self.db.add(**info)
+            yield event.plain_result(
+                f"✅ 已添加: {info['title']}\n"
+                f"   UP主: {info['author']}  |  {info['duration'] // 60}:{info['duration'] % 60:02d}"
+            )
+        except Exception as e:
+            yield event.plain_result(f"😢 添加失败: {e}")
+
+    # ==================================================================
+    # 指令：/jrsq del <ID>
+    # ==================================================================
+    @filter.command("jrsq del")
+    async def cmd_delete(self, event: AstrMessageEvent):
+        """删除曲目，用法: /jrsq del 3"""
+        try:
+            parts = event.message_str.strip().split()
+            if len(parts) < 3:
+                yield event.plain_result("⚠️ 用法: /jrsq del <曲目ID>\n先用 /jrsq list 查看 ID")
+                return
+
+            song_id = int(parts[2])
+            ok = await self.db.delete(song_id)
+            if ok:
+                yield event.plain_result(f"✅ 已删除曲目 ID={song_id}")
+            else:
+                yield event.plain_result(f"😢 未找到 ID={song_id} 的曲目。")
+        except ValueError:
+            yield event.plain_result("⚠️ ID 必须是数字，请用 /jrsq list 查看。")
+        except Exception as e:
+            yield event.plain_result(f"😢 删除失败: {e}")
+
+    # ==================================================================
+    # 指令：/jrsq search <关键词>
+    # ==================================================================
+    @filter.command("jrsq search")
+    async def cmd_search(self, event: AstrMessageEvent):
+        """搜索曲目，用法: /jrsq search 深海"""
+        try:
+            msg = event.message_str.strip()
+            keyword = " ".join(msg.split()[2:]) if len(msg.split()) > 2 else ""
+            if not keyword:
+                yield event.plain_result("⚠️ 用法: /jrsq search <关键词>")
+                return
+
+            songs = await self.db.search(keyword)
+            if not songs:
+                yield event.plain_result(f"😢 未找到包含「{keyword}」的曲目。")
+                return
+
+            lines = [f"🔍 搜索「{keyword}」结果 ({len(songs)}首):"]
+            for s in songs:
+                dur = s.get("duration", 0)
+                dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "??:??"
+                lines.append(f"  [{s['id']}] {s['title']}  |  {dur_str}  |  {s['bvid']}")
+            yield event.plain_result("\n".join(lines))
+        except Exception as e:
+            yield event.plain_result(f"😢 搜索失败: {e}")
+
+    # ==================================================================
+    # 指令：/jrsq favsync
+    # ==================================================================
+    @filter.command("jrsq favsync")
+    async def cmd_favsync(self, event: AstrMessageEvent):
+        """从 B站收藏夹同步新曲目到本地数据库"""
+        try:
+            yield event.plain_result(f"🔄 正在从收藏夹 (media_id={self.media_id}) 同步...")
+
+            # 拉取收藏夹全部视频
+            fav_videos = await BiliAPI.fetch_fav_all(self.media_id, self.page_size)
+            if not fav_videos:
+                yield event.plain_result(
+                    "😢 收藏夹为空或无法访问，请检查 media_id 是否正确。\n"
+                    "提示: 在 B站收藏夹页面 URL 中可找到 media_id"
+                )
+                return
+
+            # 去重
+            existing = await self.db.get_all_bvids()
+            new_count = 0
+            skip_count = 0
+            fail_count = 0
+
+            for v in fav_videos:
+                if v["bvid"] in existing:
+                    skip_count += 1
+                    continue
+                # 获取完整信息后写入
+                try:
+                    info = await BiliAPI.get_video_info(v["bvid"])
+                    if info:
+                        await self.db.add(**info)
+                        new_count += 1
+                    else:
+                        fail_count += 1
+                except Exception:
+                    fail_count += 1
+
+            total = await self.db.count()
+            yield event.plain_result(
+                f"✅ 同步完成！\n"
+                f"   📥 新增: {new_count} 首\n"
+                f"   ⏭️ 已存在: {skip_count} 首\n"
+                f"   ❌ 失败: {fail_count} 首\n"
+                f"   📊 曲库总计: {total} 首"
+            )
+        except Exception as e:
+            logger.error(f"[jrsq] 同步失败: {e}", exc_info=True)
+            yield event.plain_result(f"😢 同步失败: {e}")
+
+    # ==================================================================
+    # 指令：/jrsq count
+    # ==================================================================
+    @filter.command("jrsq count")
+    async def cmd_count(self, event: AstrMessageEvent):
+        """查看曲库曲目数"""
+        try:
+            cnt = await self.db.count()
+            yield event.plain_result(f"📊 曲库共有 {cnt} 首术曲。")
         except Exception as e:
             yield event.plain_result(f"😢 查询失败: {e}")
 
@@ -261,22 +568,20 @@ class JRSQPlugin(Star):
     # 定时推送
     # ==================================================================
     async def scheduled_push(self):
-        """每天定时推送到配置的群聊。"""
-        result_msg = await self.get_shuju_data()
-
-        if not self.target_groups:
-            logger.warning("[jrsq] 未配置目标群组，跳过定时推送。")
+        """每天定时推送"""
+        song = await self.db.random()
+        if song is None:
+            logger.warning("[jrsq] 曲库为空，跳过定时推送。")
             return
+
+        msg = await self._build_video_message(song)
 
         for group_id in self.target_groups:
             try:
                 gid = str(group_id).strip()
                 if not gid:
                     continue
-                await self.context.send_message(
-                    target=gid,
-                    message=MessageChain([Plain(result_msg)]),
-                )
-                await asyncio.sleep(1)  # 群间间隔，避免风控
+                await self.context.send_message(target=gid, message=msg)
+                await asyncio.sleep(1.5)
             except Exception as e:
                 logger.error(f"[jrsq] 推送到群 {group_id} 失败: {e}")
