@@ -1,22 +1,26 @@
-# 🎵 astrbot-plugin-vocadaily
+<p align="center">
+  <img src="jsrqmiku.png" alt="封面" width="600">
+</p>
+
+# astrbot-plugin-vocadaily
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue.svg)](https://github.com/Soulter/AstrBot)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> 🎧 为 [AstrBot](https://github.com/Soulter/AstrBot) 打造的每日术曲（Vocaloid）推荐插件。
-> 从 B站收藏夹同步曲库，每天为你推送一首术曲 **视频**（非链接）。
+> 为 [AstrBot](https://github.com/Soulter/AstrBot) 打造的每日术曲（Vocaloid）推荐插件。
+> 从 B站收藏夹同步曲库，每天为你推送一首术曲视频（非链接）。
 
-## ✨ 功能
+## 功能
 
-- **📺 视频直发** — 自动获取 B站视频流，以视频消息发送（非文字链接），失败自动降级
-- **🕒 定时推送** — 每天中午 12:00 自动推送（可在配置中调整时间）
-- **💬 指令唤醒** — 随时用指令获取随机术曲
-- **🗄️ 本地曲库** — SQLite 数据库存储曲目元数据（标题/BV号/UP主/时长）
-- **🔄 收藏夹同步** — 一键从 B站公开收藏夹批量导入曲库
-- **🔍 曲库管理** — 支持添加/删除/搜索/列表查看曲目
+- 自动获取 B站视频流，以视频消息发送，失败自动降级为链接
+- 每天中午 12:00 定时推送（可在配置中调整时间）
+- 随时用指令获取随机术曲
+- SQLite 本地曲库，存储标题/BV号/UP主/时长等元数据
+- 一键从 B站公开收藏夹批量导入曲库
+- 支持添加/删除/搜索/列表查看曲目
 
-## 📋 指令列表
+## 指令列表
 
 | 指令 | 说明 | 示例 |
 |------|------|------|
@@ -28,7 +32,7 @@
 | `/jrsq favsync` | 从收藏夹同步新曲目 | `/jrsq favsync` |
 | `/jrsq count` | 查看曲库总数 | `/jrsq count` |
 
-## ⚙️ 配置
+## 配置
 
 配置文件位于 `data/plugin_config.json`：
 
@@ -50,7 +54,7 @@
 
 | 字段 | 说明 |
 |------|------|
-| `bilibili.media_id` | B站收藏夹 ID（⚠️ 必改，在收藏夹页 URL 中获取） |
+| `bilibili.media_id` | B站收藏夹 ID（**必改**，在收藏夹页 URL 中获取） |
 | `bilibili.page_size` | 每次 API 请求拉取的视频数 |
 | `push.cron_hour` / `cron_minute` | 定时推送时间（24小时制） |
 | `push.target_groups` | 需要推送的群聊 ID 列表 |
@@ -61,7 +65,7 @@
 2. URL 格式为 `https://space.bilibili.com/xxxx/favlist?fid=你的media_id`
 3. 将 `fid=` 后面的数字填入配置
 
-## 📦 手动安装
+## 手动安装
 
 1. 进入 AstrBot 插件目录：
    ```bash
@@ -84,19 +88,20 @@
 
 6. 首次使用先运行 `/jrsq favsync` 同步曲库
 
-## 🏗️ 项目结构
+## 项目结构
 
 ```
 astrbot-plugin-vocadaily/
 ├── main.py                # 插件主程序
 ├── manifest.json          # 插件元信息
 ├── requirements.txt       # Python 依赖
+├── jsrqmiku.png           # 封面图
 ├── README.md
 └── data/
     ├── plugin_config.json # 插件配置
     └── jrsq.db            # SQLite 曲库（运行后自动生成）
 ```
 
-## 📄 License
+## License
 
-MIT © sakura
+MIT (c) sakura
