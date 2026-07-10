@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import time
@@ -15,6 +16,7 @@ from typing import Any
 import aiohttp
 import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import File, Plain, Record, Video
 from astrbot.api.star import Context, Star, register
@@ -52,9 +54,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "media_id": "",
         "page_size": 20,
-        "search_count": 5,
-        "search_suffix": "VOCALOID",
-        "default_query": "VOCALOID 术曲",
+        "search_count": 10,
+        "search_suffix": "VOCALOID 原曲 MV",
+        "default_query": "术曲",
         "cookie": "",
         "cookies_file": "",
     },
@@ -78,7 +80,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cron_hour": 12,
         "cron_minute": 0,
         "timezone": "Asia/Shanghai",
-        "fallback_search_query": "VOCALOID 术曲",
+        "fallback_search_query": "术曲",
         "target_umos": [],
     },
 }
@@ -198,7 +200,9 @@ class SongDB:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def list_all(self, page: int = 1, per_page: int = 10) -> tuple[list[dict], int]:
+    async def list_all(
+        self, page: int = 1, per_page: int = 10
+    ) -> tuple[list[dict], int]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT COUNT(*) FROM songs")
@@ -269,7 +273,9 @@ class BiliAPI:
             "duration": int(detail.get("duration") or 0),
         }
 
-    async def _fav_page(self, media_id: str, page: int, page_size: int) -> dict[str, Any]:
+    async def _fav_page(
+        self, media_id: str, page: int, page_size: int
+    ) -> dict[str, Any]:
         return await self._json(
             BILI_FAV_API,
             {"media_id": media_id, "pn": page, "ps": page_size, "platform": "web"},
@@ -288,14 +294,17 @@ class BiliAPI:
         pages: list[dict[str, Any]] = [first]
         if total_pages > 1:
             results = await asyncio.gather(
-                *(self._fav_page(media_id, page, page_size) for page in range(2, total_pages + 1)),
+                *(
+                    self._fav_page(media_id, page, page_size)
+                    for page in range(2, total_pages + 1)
+                ),
                 return_exceptions=True,
             )
             pages.extend(result for result in results if isinstance(result, dict))
 
         videos: list[dict] = []
         for page in pages:
-            for item in ((page.get("data") or {}).get("medias") or []):
+            for item in (page.get("data") or {}).get("medias") or []:
                 bvid = item.get("bvid") or ""
                 title = (item.get("title") or "").strip()
                 if bvid and title:
@@ -349,7 +358,9 @@ class BiliMediaService:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30), headers=headers
             ) as session:
-                async with session.get(BILI_VIEW_API, params={"bvid": bvid}) as response:
+                async with session.get(
+                    BILI_VIEW_API, params={"bvid": bvid}
+                ) as response:
                     response.raise_for_status()
                     payload = await response.json(content_type=None)
         except Exception as exc:
@@ -363,7 +374,8 @@ class BiliMediaService:
                 "bvid": detail.get("bvid") or bvid,
                 "cid": int(detail.get("cid") or 0),
                 "title": detail.get("title") or track.get("title"),
-                "author": (detail.get("owner") or {}).get("name") or track.get("author"),
+                "author": (detail.get("owner") or {}).get("name")
+                or track.get("author"),
                 "duration": int(detail.get("duration") or track.get("duration") or 0),
             }
         )
@@ -377,7 +389,9 @@ class BiliMediaService:
             try:
                 return await self._search_html(query)
             except MediaError as html_error:
-                raise MediaError(f"{ytdlp_error}；网页搜索也失败: {html_error}") from html_error
+                raise MediaError(
+                    f"{ytdlp_error}；网页搜索也失败: {html_error}"
+                ) from html_error
 
     async def _search_html(self, query: str) -> list[dict[str, Any]]:
         """B站 JSON 搜索被 412 风控时，从服务端渲染的搜索页提取结果。"""
@@ -389,8 +403,12 @@ class BiliMediaService:
             headers["Cookie"] = str(self.bili_config["cookie"])
         timeout = aiohttp.ClientTimeout(total=30)
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(BILI_SEARCH_PAGE, params={"keyword": search_query}) as response:
+            async with aiohttp.ClientSession(
+                timeout=timeout, headers=headers
+            ) as session:
+                async with session.get(
+                    BILI_SEARCH_PAGE, params={"keyword": search_query}
+                ) as response:
                     response.raise_for_status()
                     body = await response.text()
         except Exception as exc:
@@ -432,7 +450,9 @@ class BiliMediaService:
         options["extract_flat"] = "in_playlist"
         try:
             with YoutubeDL(options) as ydl:
-                result = ydl.extract_info(f"bilisearch{count}:{search_query}", download=False)
+                result = ydl.extract_info(
+                    f"bilisearch{count}:{search_query}", download=False
+                )
         except Exception as exc:
             raise MediaError(f"B站搜索失败: {exc}") from exc
 
@@ -441,7 +461,9 @@ class BiliMediaService:
             if not entry:
                 continue
             url = entry.get("webpage_url") or entry.get("url")
-            bvid = _extract_bvid(str(url or "")) or _extract_bvid(str(entry.get("id") or ""))
+            bvid = _extract_bvid(str(url or "")) or _extract_bvid(
+                str(entry.get("id") or "")
+            )
             raw_title = entry.get("title")
             # 当前搜索提取器有时只返回 av 号且没有标题；让网页搜索兜底，
             # 避免把纯数字误当成 BV 号并发给播放接口。
@@ -473,11 +495,15 @@ class BiliMediaService:
         try:
             return await self._download_progressive(track)
         except MediaError as progressive_error:
-            logger.info("[shuqu] B站单文件 MP4 获取失败，尝试 yt-dlp: %s", progressive_error)
+            logger.info(
+                "[shuqu] B站单文件 MP4 获取失败，尝试 yt-dlp: %s", progressive_error
+            )
             try:
                 return await asyncio.to_thread(self._download_sync, track)
             except MediaError as ytdlp_error:
-                raise MediaError(f"{progressive_error}；yt-dlp 也失败: {ytdlp_error}") from ytdlp_error
+                raise MediaError(
+                    f"{progressive_error}；yt-dlp 也失败: {ytdlp_error}"
+                ) from ytdlp_error
 
     @staticmethod
     def _find_cached(track: dict[str, Any]) -> Path | None:
@@ -487,7 +513,11 @@ class BiliMediaService:
             for path in CACHE_DIR.glob(f"{media_id}.*")
             if path.is_file() and path.suffix not in {".part", ".ytdl", ".json"}
         ]
-        return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+        return (
+            max(candidates, key=lambda path: path.stat().st_mtime)
+            if candidates
+            else None
+        )
 
     async def _download_progressive(
         self, track: dict[str, Any]
@@ -500,17 +530,23 @@ class BiliMediaService:
         if self.bili_config.get("cookie"):
             headers["Cookie"] = str(self.bili_config["cookie"])
         timeout = aiohttp.ClientTimeout(total=180)
-        max_bytes = max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        max_bytes = (
+            max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        )
         height = max(144, int(self.media_config.get("video_height") or 480))
         quality = 64 if height >= 720 else 32 if height >= 480 else 16
         output = CACHE_DIR / f"{_safe_filename(bvid)}.mp4"
         temp = output.with_suffix(".mp4.part")
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with aiohttp.ClientSession(
+                timeout=timeout, headers=headers
+            ) as session:
                 detail = track
                 cid = int(track.get("cid") or 0)
                 if not cid:
-                    async with session.get(BILI_VIEW_API, params={"bvid": bvid}) as response:
+                    async with session.get(
+                        BILI_VIEW_API, params={"bvid": bvid}
+                    ) as response:
                         response.raise_for_status()
                         view = await response.json(content_type=None)
                     detail = view.get("data") or {}
@@ -554,8 +590,11 @@ class BiliMediaService:
             merged.update(
                 {
                     "title": detail.get("title") or track.get("title"),
-                    "author": (detail.get("owner") or {}).get("name") or track.get("author"),
-                    "duration": int(detail.get("duration") or track.get("duration") or 0),
+                    "author": (detail.get("owner") or {}).get("name")
+                    or track.get("author"),
+                    "duration": int(
+                        detail.get("duration") or track.get("duration") or 0
+                    ),
                     "bvid": detail.get("bvid") or bvid,
                 }
             )
@@ -573,7 +612,9 @@ class BiliMediaService:
             return cached, track
 
         height = max(144, int(self.media_config.get("video_height") or 480))
-        max_bytes = max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        max_bytes = (
+            max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        )
         options = self._base_options()
         options.update(
             {
@@ -656,7 +697,9 @@ class NeteaseService:
         tracks: list[dict[str, Any]] = []
         for song in songs:
             artists = song.get("artists") or song.get("ar") or []
-            author = " / ".join(item.get("name", "") for item in artists if item.get("name"))
+            author = " / ".join(
+                item.get("name", "") for item in artists if item.get("name")
+            )
             song_id = str(song.get("id") or "")
             if not song_id:
                 continue
@@ -666,7 +709,9 @@ class NeteaseService:
                     "id": song_id,
                     "title": song.get("name") or song_id,
                     "author": author or "未知",
-                    "duration": int((song.get("duration") or song.get("dt") or 0) / 1000),
+                    "duration": int(
+                        (song.get("duration") or song.get("dt") or 0) / 1000
+                    ),
                     "url": f"{NETEASE_SONG_BASE}{song_id}",
                 }
             )
@@ -681,7 +726,9 @@ class NeteaseService:
             return existing
         temp = existing.with_suffix(".mp3.part")
         media_url = f"https://music.163.com/song/media/outer/url?id={song_id}.mp3"
-        max_bytes = max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        max_bytes = (
+            max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        )
         try:
             async with self.session.get(media_url, allow_redirects=True) as response:
                 response.raise_for_status()
@@ -711,9 +758,13 @@ class NeteaseService:
         configured = str(self.media_config.get("ffmpeg_location") or "").strip()
         ffmpeg = configured or shutil.which("ffmpeg")
         if configured and Path(configured).is_dir():
-            ffmpeg = str(Path(configured) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"))
+            ffmpeg = str(
+                Path(configured) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            )
         if not ffmpeg:
-            raise MediaError("send_mode=record 需要安装 ffmpeg，或填写 media.ffmpeg_location")
+            raise MediaError(
+                "send_mode=record 需要安装 ffmpeg，或填写 media.ffmpeg_location"
+            )
         output = CACHE_DIR / f"netease_{_safe_filename(song_id)}.wav"
         if output.exists() and output.stat().st_size > 1024:
             return output
@@ -752,7 +803,9 @@ class JRSQPlugin(Star):
         self.bili_media = BiliMediaService(self.bili_config, self.media_config)
         self.netease: NeteaseService | None = None
         self.media_lock = asyncio.Lock()
-        self.scheduler = AsyncIOScheduler(timezone=self.push_config.get("timezone", "Asia/Shanghai"))
+        self.scheduler = AsyncIOScheduler(
+            timezone=self.push_config.get("timezone", "Asia/Shanghai")
+        )
         if self.push_config.get("enabled", True):
             self.scheduler.add_job(
                 self.scheduled_push,
@@ -803,10 +856,15 @@ class JRSQPlugin(Star):
             f"⏱️ {_format_duration(track.get('duration'))}"
         )
 
-    async def _bili_chain(self, track: dict[str, Any], prefix: str = "🎵 术曲推荐") -> list:
+    async def _bili_chain(
+        self, track: dict[str, Any], prefix: str = "🎵 术曲推荐"
+    ) -> list:
         async with self.media_lock:
             path, detail = await self.bili_media.download(track)
-        return [Plain(self._bili_text(detail, prefix)), Video.fromFileSystem(path=str(path))]
+        return [
+            Plain(self._bili_text(detail, prefix)),
+            Video.fromFileSystem(path=str(path)),
+        ]
 
     async def _netease_chain(self, track: dict[str, Any]) -> list:
         if not self.netease:
@@ -833,6 +891,7 @@ class JRSQPlugin(Star):
         query: str,
         source: str | None = None,
         prefix: str = "🔎 找到术曲",
+        random_choice: bool = False,
     ) -> tuple[list, str]:
         aliases = {
             "bili": "bilibili",
@@ -846,18 +905,24 @@ class JRSQPlugin(Star):
         if source:
             sources = [aliases.get(source.lower(), source.lower())]
         else:
-            sources = list(self.media_config.get("source_order") or ["bilibili", "netease"])
+            sources = list(
+                self.media_config.get("source_order") or ["bilibili", "netease"]
+            )
         errors: list[str] = []
         for current in sources:
             try:
                 if current == "bilibili" and self.bili_config.get("enabled", True):
                     tracks = await self.bili_media.search(query)
+                    if random_choice:
+                        random.shuffle(tracks)
                     candidate_errors: list[str] = []
                     for item in tracks:
                         try:
                             track = await self.bili_media.enrich(item)
                             if not self._duration_allowed(track):
-                                candidate_errors.append(f"{track['title']} 超过时长限制")
+                                candidate_errors.append(
+                                    f"{track['title']} 超过时长限制"
+                                )
                                 continue
                             return await self._bili_chain(track, prefix), "B站"
                         except Exception as exc:
@@ -943,7 +1008,9 @@ class JRSQPlugin(Star):
             logger.error("[shuqu] 指定曲目失败: %s", exc, exc_info=True)
             yield event.plain_result(f"😢 没能获取「{query}」：{exc}")
 
-    async def _command_help(self, event: AstrMessageEvent, _args: list[str] | None = None):
+    async def _command_help(
+        self, event: AstrMessageEvent, _args: list[str] | None = None
+    ):
         yield event.plain_result(
             "🎵 今日术曲指令\n"
             "/jrsq <曲名>  去B站搜索、下载并发送完整视频\n"
@@ -959,13 +1026,19 @@ class JRSQPlugin(Star):
             "兼容别名：/shuqu。网易云为可选扩展，默认关闭。"
         )
 
-    async def _command_random(self, event: AstrMessageEvent, _args: list[str] | None = None):
+    async def _command_random(
+        self, event: AstrMessageEvent, _args: list[str] | None = None
+    ):
         try:
             song = await self.db.random()
             if not song:
-                query = str(self.bili_config.get("default_query") or "VOCALOID 术曲")
-                yield event.plain_result(f"🔍 曲库为空，正在从B站搜索「{query}」并下载视频...")
-                chain, _ = await self._search_and_build(query, "bilibili")
+                query = str(self.bili_config.get("default_query") or "术曲")
+                yield event.plain_result(
+                    f"🔍 曲库为空，正在从B站搜索「{query}」并下载视频..."
+                )
+                chain, _ = await self._search_and_build(
+                    query, "bilibili", random_choice=True
+                )
                 yield event.chain_result(chain)
                 return
             yield event.plain_result(f"🎲 抽到「{song['title']}」，正在准备视频...")
@@ -1030,7 +1103,9 @@ class JRSQPlugin(Star):
             song_id = int(args[0])
             deleted = await self.db.delete(song_id)
             yield event.plain_result(
-                f"✅ 已删除曲目 ID={song_id}" if deleted else f"😢 未找到 ID={song_id} 的曲目。"
+                f"✅ 已删除曲目 ID={song_id}"
+                if deleted
+                else f"😢 未找到 ID={song_id} 的曲目。"
             )
         except ValueError:
             yield event.plain_result("⚠️ 曲目 ID 必须是数字。")
@@ -1054,7 +1129,9 @@ class JRSQPlugin(Star):
     async def _command_sync(self, event: AstrMessageEvent, _args: list[str]):
         media_id = str(self.bili_config.get("media_id") or "").strip()
         if not media_id:
-            yield event.plain_result("⚠️ 请先在 data/plugin_config.json 填写 bilibili.media_id。")
+            yield event.plain_result(
+                "⚠️ 请先在 data/plugin_config.json 填写 bilibili.media_id。"
+            )
             return
         if not self.bili_api:
             yield event.plain_result("😢 B站服务尚未初始化。")
@@ -1118,7 +1195,9 @@ class JRSQPlugin(Star):
 
     async def _command_status(self, event: AstrMessageEvent, _args: list[str]):
         targets = self.push_config.get("target_umos") or []
-        cache_size = sum(path.stat().st_size for path in CACHE_DIR.glob("*") if path.is_file())
+        cache_size = sum(
+            path.stat().st_size for path in CACHE_DIR.glob("*") if path.is_file()
+        )
         yield event.plain_result(
             "⚙️ 术曲插件状态\n"
             f"B站：{'开启' if self.bili_config.get('enabled', True) else '关闭'}\n"
@@ -1156,15 +1235,18 @@ class JRSQPlugin(Star):
                 query = str(
                     self.push_config.get("fallback_search_query")
                     or self.bili_config.get("default_query")
-                    or "VOCALOID 术曲"
+                    or "术曲"
                 )
                 components, _ = await self._search_and_build(
                     query,
                     "bilibili",
                     "🌞 每日术曲推荐",
+                    random_choice=True,
                 )
         except Exception as exc:
-            logger.error("[jrsq] 定时推送视频准备失败，不发送链接: %s", exc, exc_info=True)
+            logger.error(
+                "[jrsq] 定时推送视频准备失败，不发送链接: %s", exc, exc_info=True
+            )
             return
         for umo in targets:
             try:

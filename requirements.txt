@@ -1,4 +1,4 @@
-astrbot>=4.25.0
+astrbot>=4.19.2
 apscheduler>=3.10.0
 aiohttp>=3.11.0
 aiosqlite>=0.21.0

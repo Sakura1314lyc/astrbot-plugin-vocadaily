@@ -3,9 +3,9 @@
     "enabled": true,
     "media_id": "8745208",
     "page_size": 20,
-    "search_count": 5,
-    "search_suffix": "VOCALOID",
-    "default_query": "VOCALOID 术曲",
+    "search_count": 10,
+    "search_suffix": "VOCALOID 原曲 MV",
+    "default_query": "术曲",
     "cookie": "",
     "cookies_file": ""
   },
@@ -31,7 +31,7 @@
     "cron_hour": 12,
     "cron_minute": 0,
     "timezone": "Asia/Shanghai",
-    "fallback_search_query": "VOCALOID 术曲",
+    "fallback_search_query": "术曲",
     "target_umos": []
   }
 }

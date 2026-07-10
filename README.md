@@ -4,13 +4,13 @@
 
 # astrbot-plugin-vocadaily
 
-[![AstrBot](https://img.shields.io/badge/AstrBot-4.25%2B-blue.svg)](https://github.com/AstrBotDevs/AstrBot)
+[![AstrBot](https://img.shields.io/badge/AstrBot-4.19.2%2B-blue.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 AstrBot 每日术曲视频推送插件。
 
-核心功能是 `/jrsq`：机器人自动到 B站搜索术曲，下载完整 MP4，再通过 AstrBot 的 `Video` 消息段把整个视频发送到群里。成功结果不是网页链接，也不是链接预览。
+核心功能是 `/jrsq`：机器人自动到 B站搜索术曲，下载完整 MP4，再通过 AstrBot 的 `Video` 消息段把整个视频发送到群里。
 
 ## 核心功能
 
@@ -23,7 +23,7 @@ AstrBot 每日术曲视频推送插件。
 - 限制视频分辨率、时长和大小，并自动清理缓存
 - 下载或视频准备失败时只记录错误，不用链接冒充视频结果
 
-网易云功能仍然保留，但属于可选扩展，默认关闭，不影响 `/jrsq` 的 B站视频主流程。
+网易云功能默认关闭，不影响 `/jrsq` 的 B站视频主流程。
 
 ## 指令
 
@@ -56,7 +56,7 @@ pip install -r requirements.txt
 
 重启 AstrBot 或在 WebUI 中重载插件。
 
-插件要求 AstrBot `4.25.0+`，B站搜索与下载依赖 `yt-dlp`。建议安装 `ffmpeg`，用于合并 B站提供的 DASH 音视频流；没有 ffmpeg 时，插件会优先请求游客可用的带声音单文件 MP4。
+插件要求 AstrBot `4.19.2+`，B站搜索与下载依赖 `yt-dlp`。建议安装 `ffmpeg`，用于合并 B站提供的 DASH 音视频流；没有 ffmpeg 时，插件会优先请求游客可用的带声音单文件 MP4。
 
 ## 基础配置
 
@@ -68,9 +68,9 @@ pip install -r requirements.txt
     "enabled": true,
     "media_id": "8745208",
     "page_size": 20,
-    "search_count": 5,
-    "search_suffix": "VOCALOID",
-    "default_query": "VOCALOID 术曲",
+    "search_count": 10,
+    "search_suffix": "VOCALOID 原曲 MV",
+    "default_query": "术曲",
     "cookie": "",
     "cookies_file": ""
   },
@@ -94,7 +94,7 @@ pip install -r requirements.txt
     "cron_hour": 12,
     "cron_minute": 0,
     "timezone": "Asia/Shanghai",
-    "fallback_search_query": "VOCALOID 术曲",
+    "fallback_search_query": "术曲",
     "target_umos": []
   }
 }
@@ -151,7 +151,7 @@ aiocqhttp:GroupMessage:123456789
 每天到达配置时间后：
 
 1. 曲库有内容：随机选取一条 B站视频记录。
-2. 曲库为空：使用 `fallback_search_query` 自动搜索 B站。
+2. 曲库为空：使用 `fallback_search_query` 自动搜索 B站，并从候选结果中随机选择，避免每天重复同一个视频。
 3. 下载完整视频并构造 AstrBot `Video.fromFileSystem(...)` 消息。
 4. 向所有绑定群发送视频。
 5. 视频准备失败：本次不发送，不降级成链接。
