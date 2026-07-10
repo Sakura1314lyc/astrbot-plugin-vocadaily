@@ -1,42 +1,45 @@
-"""
-astrbot-plugin-vocadaily — 每日术曲推荐插件
-
-功能：
-  - 从 B站收藏夹同步曲库到本地 SQLite 数据库
-  - /jrsq          随机推荐一首术曲（发送视频 + 信息）
-  - /jrsq list     查看曲库列表（分页）
-  - /jrsq add      手动添加曲目（BV号）
-  - /jrsq del      删除曲目
-  - /jrsq search   按标题搜索
-  - /jrsq favsync  从收藏夹同步新曲目
-  - /jrsq count    查看曲库数量
-  - 每天定时推送
-"""
+"""AstrBot 每日术曲插件：B站视频、网易云音频、曲库和定时推送。"""
 
 import asyncio
+import html
 import json
 import logging
+import math
 import os
+import re
+import shutil
+import time
+from pathlib import Path
+from typing import Any
 
 import aiohttp
 import aiosqlite
-from astrbot.api.all import *
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import File, Plain, Record, Video
+from astrbot.api.star import Context, Star, register
+
+try:
+    from yt_dlp import YoutubeDL
+except ImportError:  # AstrBot 安装 requirements.txt 前仍允许插件给出可读错误
+    YoutubeDL = None
+
 
 logger = logging.getLogger("astrbot")
 
-# ============================================================================
-# 常量
-# ============================================================================
-PLUGIN_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(PLUGIN_DIR, "data")
-DB_PATH = os.path.join(DATA_DIR, "jrsq.db")
-CONFIG_PATH = os.path.join(DATA_DIR, "plugin_config.json")
+PLUGIN_DIR = Path(__file__).resolve().parent
+DATA_DIR = PLUGIN_DIR / "data"
+DB_PATH = DATA_DIR / "jrsq.db"
+CONFIG_PATH = DATA_DIR / "plugin_config.json"
+CACHE_DIR = DATA_DIR / "media_cache"
 
 BILI_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
-BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl"
 BILI_FAV_API = "https://api.bilibili.com/x/v3/fav/resource/list"
+BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl"
+BILI_SEARCH_PAGE = "https://search.bilibili.com/all"
 BILI_VIDEO_BASE = "https://www.bilibili.com/video/"
+NETEASE_SEARCH_API = "https://music.163.com/api/search/get"
+NETEASE_SONG_BASE = "https://music.163.com/#/song?id="
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -44,33 +47,107 @@ UA = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-os.makedirs(DATA_DIR, exist_ok=True)
+DEFAULT_CONFIG: dict[str, Any] = {
+    "bilibili": {
+        "enabled": True,
+        "media_id": "",
+        "page_size": 20,
+        "search_count": 5,
+        "search_suffix": "VOCALOID",
+        "cookie": "",
+        "cookies_file": "",
+    },
+    "netease": {
+        "enabled": True,
+        "search_count": 5,
+        "cookie": "",
+        "send_mode": "file",
+    },
+    "media": {
+        "source_order": ["bilibili", "netease"],
+        "video_height": 480,
+        "max_duration_seconds": 900,
+        "max_file_size_mb": 100,
+        "cache_hours": 24,
+        "ffmpeg_location": "",
+        "proxy": "",
+    },
+    "push": {
+        "enabled": True,
+        "cron_hour": 12,
+        "cron_minute": 0,
+        "timezone": "Asia/Shanghai",
+        "target_umos": [],
+    },
+}
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ============================================================================
-# 配置
-# ============================================================================
-def load_plugin_config() -> dict:
-    if not os.path.exists(CONFIG_PATH):
-        return {}
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+class MediaError(RuntimeError):
+    """可直接显示给用户的媒体检索或下载错误。"""
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in base.items():
+        result[key] = _deep_merge(value, {}) if isinstance(value, dict) else value
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
-# ============================================================================
-# 数据库层
-# ============================================================================
+
+def load_plugin_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return _deep_merge(DEFAULT_CONFIG, {})
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as file:
+            raw = json.load(file)
+        if not isinstance(raw, dict):
+            raise ValueError("配置根节点必须是 JSON 对象")
+        return _deep_merge(DEFAULT_CONFIG, raw)
+    except Exception as exc:
+        logger.error("[shuqu] 读取配置失败，使用默认配置: %s", exc)
+        return _deep_merge(DEFAULT_CONFIG, {})
+
+
+def save_plugin_config(config: dict[str, Any]) -> None:
+    temp_path = CONFIG_PATH.with_suffix(".json.tmp")
+    with temp_path.open("w", encoding="utf-8", newline="\n") as file:
+        json.dump(config, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+    os.replace(temp_path, CONFIG_PATH)
+
+
+def _safe_filename(value: str, fallback: str = "media") -> str:
+    value = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", value).strip(" .")
+    return value[:80] or fallback
+
+
+def _format_duration(seconds: int | float | None) -> str:
+    seconds = max(0, int(seconds or 0))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _extract_bvid(value: str) -> str | None:
+    match = re.search(r"BV[0-9A-Za-z]{10}", value, re.IGNORECASE)
+    return match.group(0) if match else None
+
+
 class SongDB:
-    """本地 SQLite 曲库"""
+    """兼容旧版数据库结构的本地 B站曲库。"""
 
-    def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
+    def __init__(self, db_path: Path = DB_PATH):
+        self.db_path = str(db_path)
 
     async def init(self) -> None:
-        """初始化数据库表"""
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS songs (
                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
                     bvid     TEXT    NOT NULL UNIQUE,
@@ -81,14 +158,19 @@ class SongDB:
                     duration INTEGER DEFAULT 0,
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            """)
+                """
+            )
             await db.commit()
 
-    # ---- 增删改查 ----
-
-    async def add(self, bvid: str, cid: int, title: str,
-                  author: str = "", cover: str = "", duration: int = 0) -> bool:
-        """添加曲目，已存在则返回 False"""
+    async def add(
+        self,
+        bvid: str,
+        cid: int,
+        title: str,
+        author: str = "",
+        cover: str = "",
+        duration: int = 0,
+    ) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             try:
                 await db.execute(
@@ -102,482 +184,978 @@ class SongDB:
                 return False
 
     async def delete(self, song_id: int) -> bool:
-        """按 ID 删除"""
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("DELETE FROM songs WHERE id = ?", (song_id,))
+            cursor = await db.execute("DELETE FROM songs WHERE id = ?", (song_id,))
             await db.commit()
-            return cur.rowcount > 0
+            return cursor.rowcount > 0
 
-    async def random(self) -> dict | None:
-        """随机返回一首"""
+    async def random(self) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM songs ORDER BY RANDOM() LIMIT 1")
-            row = await cur.fetchone()
+            cursor = await db.execute("SELECT * FROM songs ORDER BY RANDOM() LIMIT 1")
+            row = await cursor.fetchone()
             return dict(row) if row else None
 
     async def list_all(self, page: int = 1, per_page: int = 10) -> tuple[list[dict], int]:
-        """分页列表，返回 (条目列表, 总条数)"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            # 总数
-            cur = await db.execute("SELECT COUNT(*) FROM songs")
-            total = (await cur.fetchone())[0]
-            # 分页
-            offset = (page - 1) * per_page
-            cur = await db.execute(
+            cursor = await db.execute("SELECT COUNT(*) FROM songs")
+            total = (await cursor.fetchone())[0]
+            cursor = await db.execute(
                 "SELECT * FROM songs ORDER BY id DESC LIMIT ? OFFSET ?",
-                (per_page, offset),
+                (per_page, (page - 1) * per_page),
             )
-            rows = [dict(r) for r in await cur.fetchall()]
-            return rows, total
+            return [dict(row) for row in await cursor.fetchall()], total
 
     async def search(self, keyword: str, limit: int = 20) -> list[dict]:
-        """按标题模糊搜索"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute(
+            cursor = await db.execute(
                 "SELECT * FROM songs WHERE title LIKE ? ORDER BY id DESC LIMIT ?",
                 (f"%{keyword}%", limit),
             )
-            return [dict(r) for r in await cur.fetchall()]
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def count(self) -> int:
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT COUNT(*) FROM songs")
-            return (await cur.fetchone())[0]
+            cursor = await db.execute("SELECT COUNT(*) FROM songs")
+            return (await cursor.fetchone())[0]
 
     async def has_bvid(self, bvid: str) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT 1 FROM songs WHERE bvid = ?", (bvid,))
-            return await cur.fetchone() is not None
+            cursor = await db.execute("SELECT 1 FROM songs WHERE bvid = ?", (bvid,))
+            return await cursor.fetchone() is not None
 
     async def get_all_bvids(self) -> set[str]:
-        """获取所有已存 BV 号（用于收藏夹同步去重）"""
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT bvid FROM songs")
-            return {r[0] for r in await cur.fetchall()}
+            cursor = await db.execute("SELECT bvid FROM songs")
+            return {row[0] for row in await cursor.fetchall()}
 
 
-# ============================================================================
-# B站 API 工具
-# ============================================================================
 class BiliAPI:
-    """封装 B站公开 API 调用（复用 session 减少连接开销）"""
+    """收藏夹和单个视频信息使用的 B站接口。"""
 
-    HEADERS = {
-        "User-Agent": UA,
-        "Referer": "https://www.bilibili.com/",
-    }
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        headers = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+        if config.get("cookie"):
+            headers["Cookie"] = str(config["cookie"])
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30), headers=headers
+        )
 
-    _session: aiohttp.ClientSession | None = None
+    async def close(self) -> None:
+        if not self.session.closed:
+            await self.session.close()
 
-    @classmethod
-    async def _get_session(cls) -> aiohttp.ClientSession:
-        """获取或创建共享 session，避免每次请求都建立新连接"""
-        if cls._session is None or cls._session.closed:
-            timeout = aiohttp.ClientTimeout(total=15)
-            cls._session = aiohttp.ClientSession(timeout=timeout, headers=cls.HEADERS)
-        return cls._session
+    async def _json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
+        async with self.session.get(url, params=params) as response:
+            response.raise_for_status()
+            return await response.json(content_type=None)
 
-    @classmethod
-    async def close_session(cls) -> None:
-        """关闭共享 session（插件卸载时调用）"""
-        if cls._session and not cls._session.closed:
-            await cls._session.close()
-
-    @classmethod
-    async def get_video_info(cls, bvid: str) -> dict | None:
-        """通过 BV 号获取视频信息 (cid, title, author, cover, duration)"""
-        s = await cls._get_session()
-        async with s.get(BILI_VIEW_API, params={"bvid": bvid}) as resp:
-            data = await resp.json()
-            if data.get("code") != 0:
-                return None
-            d = data["data"]
-            return {
-                "bvid": bvid,
-                "cid": d.get("cid", 0),
-                "title": d.get("title", ""),
-                "author": d.get("owner", {}).get("name", ""),
-                "cover": d.get("pic", ""),
-                "duration": d.get("duration", 0),
-            }
-
-    @classmethod
-    async def get_play_url(cls, bvid: str, cid: int) -> str | None:
-        """获取可下载的视频直链（MP4）。失败返回 None。"""
-        s = await cls._get_session()
-        async with s.get(
-            BILI_PLAYURL_API,
-            params={"bvid": bvid, "cid": cid, "qn": 80, "fnval": 1},
-        ) as resp:
-            data = await resp.json()
-            if data.get("code") != 0:
-                return None
-            durl = data.get("data", {}).get("durl", [])
-            if durl:
-                return durl[0].get("url")
+    async def get_video_info(self, bvid: str) -> dict[str, Any] | None:
+        data = await self._json(BILI_VIEW_API, {"bvid": bvid})
+        if data.get("code") != 0:
             return None
+        detail = data.get("data") or {}
+        return {
+            "bvid": detail.get("bvid") or bvid,
+            "cid": int(detail.get("cid") or 0),
+            "title": detail.get("title") or "未知标题",
+            "author": (detail.get("owner") or {}).get("name") or "未知",
+            "cover": detail.get("pic") or "",
+            "duration": int(detail.get("duration") or 0),
+        }
 
-    @classmethod
-    async def _fetch_fav_page(cls, media_id: str, page: int, page_size: int) -> list[dict]:
-        """拉取收藏夹单页（内部方法，使用共享 session）"""
-        s = await cls._get_session()
-        params = {"media_id": media_id, "pn": page, "ps": page_size, "platform": "web"}
-        async with s.get(BILI_FAV_API, params=params) as resp:
-            data = await resp.json()
-            if data.get("code") != 0:
-                return []
-            medias = data.get("data", {}).get("medias") or []
-            results = []
-            for item in medias:
-                bvid = item.get("bvid", "")
-                title = item.get("title", "").strip()
-                if bvid and title:
-                    results.append({"bvid": bvid, "title": title})
-            return results
+    async def _fav_page(self, media_id: str, page: int, page_size: int) -> dict[str, Any]:
+        return await self._json(
+            BILI_FAV_API,
+            {"media_id": media_id, "pn": page, "ps": page_size, "platform": "web"},
+        )
 
-    @classmethod
-    async def fetch_fav_all(cls, media_id: str, page_size: int = 20) -> list[dict]:
-        """拉取整个收藏夹，返回 [{bvid, title}, ...]"""
-        s = await cls._get_session()
-        params = {"media_id": media_id, "pn": 1, "ps": page_size, "platform": "web"}
-        async with s.get(BILI_FAV_API, params=params) as resp:
-            data = await resp.json()
-            if data.get("code") != 0:
-                raise RuntimeError(f"收藏夹 API 错误: code={data.get('code')}")
-
-        info = data.get("data", {}).get("info", {})
-        total_pages = max(1, int(info.get("page_count", 1)))
-
-        # 收集第一页
-        all_videos: list[dict] = []
-        medias = data.get("data", {}).get("medias") or []
-        for item in medias:
-            bvid = item.get("bvid", "")
-            title = item.get("title", "").strip()
-            if bvid and title:
-                all_videos.append({"bvid": bvid, "title": title})
-
-        # 剩余页并发
+    async def fetch_fav_all(self, media_id: str, page_size: int = 20) -> list[dict]:
+        first = await self._fav_page(media_id, 1, page_size)
+        if first.get("code") != 0:
+            raise MediaError(
+                f"收藏夹接口返回 {first.get('code')}: {first.get('message', '未知错误')}"
+            )
+        payload = first.get("data") or {}
+        info = payload.get("info") or {}
+        media_count = int(info.get("media_count") or 0)
+        total_pages = max(1, math.ceil(media_count / page_size))
+        pages: list[dict[str, Any]] = [first]
         if total_pages > 1:
-            tasks = [
-                cls._fetch_fav_page(media_id, p, page_size)
-                for p in range(2, total_pages + 1)
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, list):
-                    all_videos.extend(r)
+            results = await asyncio.gather(
+                *(self._fav_page(media_id, page, page_size) for page in range(2, total_pages + 1)),
+                return_exceptions=True,
+            )
+            pages.extend(result for result in results if isinstance(result, dict))
 
-        return all_videos
+        videos: list[dict] = []
+        for page in pages:
+            for item in ((page.get("data") or {}).get("medias") or []):
+                bvid = item.get("bvid") or ""
+                title = (item.get("title") or "").strip()
+                if bvid and title:
+                    videos.append({"bvid": bvid, "title": title})
+        return videos
 
 
-# ============================================================================
-# 插件主体
-# ============================================================================
-@register("jrsq", "sakura", "每日术曲推荐 — B站术曲随机推送（视频消息）", "3.0.0")
-class JRSQPlugin(Star):
+class BiliMediaService:
+    """通过 yt-dlp 搜索 B站并下载适合群聊发送的单文件视频。"""
+
+    def __init__(self, bili_config: dict[str, Any], media_config: dict[str, Any]):
+        self.bili_config = bili_config
+        self.media_config = media_config
+
+    def _base_options(self) -> dict[str, Any]:
+        if YoutubeDL is None:
+            raise MediaError("缺少 yt-dlp，请安装 requirements.txt 后重启 AstrBot")
+        headers = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+        if self.bili_config.get("cookie"):
+            headers["Cookie"] = str(self.bili_config["cookie"])
+        options: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+            "retries": 2,
+            "http_headers": headers,
+        }
+        cookies_file = str(self.bili_config.get("cookies_file") or "").strip()
+        if cookies_file:
+            cookie_path = Path(cookies_file)
+            if not cookie_path.is_absolute():
+                cookie_path = PLUGIN_DIR / cookie_path
+            if cookie_path.exists():
+                options["cookiefile"] = str(cookie_path)
+        if self.media_config.get("proxy"):
+            options["proxy"] = self.media_config["proxy"]
+        if self.media_config.get("ffmpeg_location"):
+            options["ffmpeg_location"] = self.media_config["ffmpeg_location"]
+        return options
+
+    async def enrich(self, track: dict[str, Any]) -> dict[str, Any]:
+        """用视频详情补齐网页搜索结果的 UP 主、时长和 cid。"""
+        bvid = str(track.get("bvid") or "")
+        if not bvid:
+            raise MediaError("搜索结果缺少 BV 号")
+        headers = {"User-Agent": UA, "Referer": f"{BILI_VIDEO_BASE}{bvid}"}
+        if self.bili_config.get("cookie"):
+            headers["Cookie"] = str(self.bili_config["cookie"])
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30), headers=headers
+            ) as session:
+                async with session.get(BILI_VIEW_API, params={"bvid": bvid}) as response:
+                    response.raise_for_status()
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            raise MediaError(f"B站视频详情获取失败: {exc}") from exc
+        if payload.get("code") != 0:
+            raise MediaError(f"B站视频详情接口返回 {payload.get('code')}")
+        detail = payload.get("data") or {}
+        merged = dict(track)
+        merged.update(
+            {
+                "bvid": detail.get("bvid") or bvid,
+                "cid": int(detail.get("cid") or 0),
+                "title": detail.get("title") or track.get("title"),
+                "author": (detail.get("owner") or {}).get("name") or track.get("author"),
+                "duration": int(detail.get("duration") or track.get("duration") or 0),
+            }
+        )
+        return merged
+
+    async def search(self, query: str) -> list[dict[str, Any]]:
+        try:
+            return await asyncio.to_thread(self._search_sync, query)
+        except MediaError as ytdlp_error:
+            logger.info("[shuqu] yt-dlp B站搜索不可用，尝试搜索网页: %s", ytdlp_error)
+            try:
+                return await self._search_html(query)
+            except MediaError as html_error:
+                raise MediaError(f"{ytdlp_error}；网页搜索也失败: {html_error}") from html_error
+
+    async def _search_html(self, query: str) -> list[dict[str, Any]]:
+        """B站 JSON 搜索被 412 风控时，从服务端渲染的搜索页提取结果。"""
+        count = max(1, min(20, int(self.bili_config.get("search_count") or 5)))
+        suffix = str(self.bili_config.get("search_suffix") or "").strip()
+        search_query = f"{query} {suffix}".strip()
+        headers = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+        if self.bili_config.get("cookie"):
+            headers["Cookie"] = str(self.bili_config["cookie"])
+        timeout = aiohttp.ClientTimeout(total=30)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(BILI_SEARCH_PAGE, params={"keyword": search_query}) as response:
+                    response.raise_for_status()
+                    body = await response.text()
+        except Exception as exc:
+            raise MediaError(f"B站搜索页请求失败: {exc}") from exc
+
+        pattern = re.compile(
+            r'href="//www\.bilibili\.com/video/(?P<bvid>BV[0-9A-Za-z]{10})/"'
+            r'.{0,6000}?class="bili-video-card__info--tit"\s+title="(?P<title>[^"]+)"',
+            re.DOTALL,
+        )
+        tracks: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for match in pattern.finditer(body):
+            bvid = match.group("bvid")
+            if bvid in seen:
+                continue
+            seen.add(bvid)
+            tracks.append(
+                {
+                    "source": "bilibili",
+                    "bvid": bvid,
+                    "url": f"{BILI_VIDEO_BASE}{bvid}",
+                    "title": html.unescape(match.group("title")),
+                    "author": "未知",
+                    "duration": 0,
+                }
+            )
+            if len(tracks) >= count:
+                break
+        if not tracks:
+            raise MediaError(f"B站搜索页没有找到「{query}」")
+        return tracks
+
+    def _search_sync(self, query: str) -> list[dict[str, Any]]:
+        count = max(1, min(20, int(self.bili_config.get("search_count") or 5)))
+        suffix = str(self.bili_config.get("search_suffix") or "").strip()
+        search_query = f"{query} {suffix}".strip()
+        options = self._base_options()
+        options["extract_flat"] = "in_playlist"
+        try:
+            with YoutubeDL(options) as ydl:
+                result = ydl.extract_info(f"bilisearch{count}:{search_query}", download=False)
+        except Exception as exc:
+            raise MediaError(f"B站搜索失败: {exc}") from exc
+
+        tracks: list[dict[str, Any]] = []
+        for entry in (result or {}).get("entries") or []:
+            if not entry:
+                continue
+            url = entry.get("webpage_url") or entry.get("url")
+            bvid = _extract_bvid(str(url or "")) or _extract_bvid(str(entry.get("id") or ""))
+            raw_title = entry.get("title")
+            # 当前搜索提取器有时只返回 av 号且没有标题；让网页搜索兜底，
+            # 避免把纯数字误当成 BV 号并发给播放接口。
+            if not bvid or not raw_title:
+                continue
+            if bvid and (not url or not str(url).startswith("http")):
+                url = f"{BILI_VIDEO_BASE}{bvid}"
+            if not url:
+                continue
+            title = html.unescape(re.sub(r"<[^>]+>", "", raw_title))
+            tracks.append(
+                {
+                    "source": "bilibili",
+                    "bvid": bvid,
+                    "url": url,
+                    "title": title,
+                    "author": entry.get("uploader") or entry.get("channel") or "未知",
+                    "duration": int(entry.get("duration") or 0),
+                }
+            )
+        if not tracks:
+            raise MediaError(f"B站没有找到「{query}」")
+        return tracks
+
+    async def download(self, track: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+        cached = self._find_cached(track)
+        if cached:
+            return cached, track
+        try:
+            return await self._download_progressive(track)
+        except MediaError as progressive_error:
+            logger.info("[shuqu] B站单文件 MP4 获取失败，尝试 yt-dlp: %s", progressive_error)
+            try:
+                return await asyncio.to_thread(self._download_sync, track)
+            except MediaError as ytdlp_error:
+                raise MediaError(f"{progressive_error}；yt-dlp 也失败: {ytdlp_error}") from ytdlp_error
+
+    @staticmethod
+    def _find_cached(track: dict[str, Any]) -> Path | None:
+        media_id = _safe_filename(str(track.get("bvid") or "bili"), "bili")
+        candidates = [
+            path
+            for path in CACHE_DIR.glob(f"{media_id}.*")
+            if path.is_file() and path.suffix not in {".part", ".ytdl", ".json"}
+        ]
+        return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+    async def _download_progressive(
+        self, track: dict[str, Any]
+    ) -> tuple[Path, dict[str, Any]]:
+        """下载游客可用的带声音单文件 MP4，不依赖 ffmpeg。"""
+        bvid = str(track.get("bvid") or "")
+        if not bvid:
+            raise MediaError("搜索结果缺少 BV 号")
+        headers = {"User-Agent": UA, "Referer": f"{BILI_VIDEO_BASE}{bvid}"}
+        if self.bili_config.get("cookie"):
+            headers["Cookie"] = str(self.bili_config["cookie"])
+        timeout = aiohttp.ClientTimeout(total=180)
+        max_bytes = max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        height = max(144, int(self.media_config.get("video_height") or 480))
+        quality = 64 if height >= 720 else 32 if height >= 480 else 16
+        output = CACHE_DIR / f"{_safe_filename(bvid)}.mp4"
+        temp = output.with_suffix(".mp4.part")
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                detail = track
+                cid = int(track.get("cid") or 0)
+                if not cid:
+                    async with session.get(BILI_VIEW_API, params={"bvid": bvid}) as response:
+                        response.raise_for_status()
+                        view = await response.json(content_type=None)
+                    detail = view.get("data") or {}
+                    cid = int(detail.get("cid") or 0)
+                    if view.get("code") != 0 or not cid:
+                        raise MediaError(f"B站视频信息接口返回 {view.get('code')}")
+                params = {
+                    "bvid": bvid,
+                    "cid": cid,
+                    "qn": quality,
+                    "fnval": 1,
+                    "platform": "html5",
+                    "high_quality": 1,
+                }
+                async with session.get(BILI_PLAYURL_API, params=params) as response:
+                    response.raise_for_status()
+                    play = await response.json(content_type=None)
+                urls = (play.get("data") or {}).get("durl") or []
+                if play.get("code") != 0 or not urls or not urls[0].get("url"):
+                    raise MediaError(f"B站单文件播放接口返回 {play.get('code')}")
+                declared = int(urls[0].get("size") or 0)
+                if declared and declared > max_bytes:
+                    raise MediaError(
+                        f"视频约 {declared / 1024 / 1024:.1f}MB，超过配置限制"
+                    )
+                async with session.get(urls[0]["url"]) as response:
+                    response.raise_for_status()
+                    written = 0
+                    with temp.open("wb") as file:
+                        async for chunk in response.content.iter_chunked(512 * 1024):
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise MediaError(
+                                    f"视频超过 {self.media_config.get('max_file_size_mb', 100)}MB 限制"
+                                )
+                            file.write(chunk)
+            if temp.stat().st_size <= 1024:
+                raise MediaError("B站返回的视频文件为空")
+            os.replace(temp, output)
+            merged = dict(track)
+            merged.update(
+                {
+                    "title": detail.get("title") or track.get("title"),
+                    "author": (detail.get("owner") or {}).get("name") or track.get("author"),
+                    "duration": int(detail.get("duration") or track.get("duration") or 0),
+                    "bvid": detail.get("bvid") or bvid,
+                }
+            )
+            return output, merged
+        except Exception as exc:
+            temp.unlink(missing_ok=True)
+            if isinstance(exc, MediaError):
+                raise
+            raise MediaError(f"B站单文件 MP4 下载失败: {exc}") from exc
+
+    def _download_sync(self, track: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+        media_id = _safe_filename(str(track.get("bvid") or "bili"), "bili")
+        cached = self._find_cached(track)
+        if cached:
+            return cached, track
+
+        height = max(144, int(self.media_config.get("video_height") or 480))
+        max_bytes = max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        options = self._base_options()
+        options.update(
+            {
+                "outtmpl": str(CACHE_DIR / f"{media_id}.%(ext)s"),
+                "format": (
+                    f"bestvideo[ext=mp4][height<=?{height}]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<=?{height}]+bestaudio/"
+                    f"best[height<=?{height}]"
+                ),
+                "merge_output_format": "mp4",
+                "max_filesize": max_bytes,
+                "overwrites": False,
+            }
+        )
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(str(track["url"]), download=True)
+                prepared = Path(ydl.prepare_filename(info))
+        except Exception as exc:
+            raise MediaError(f"B站视频下载失败: {exc}") from exc
+
+        files = [
+            path
+            for path in CACHE_DIR.glob(f"{media_id}.*")
+            if path.is_file() and path.suffix not in {".part", ".ytdl", ".json"}
+        ]
+        if prepared.exists() and prepared not in files:
+            files.append(prepared)
+        if not files:
+            raise MediaError("yt-dlp 未生成可发送的视频文件")
+        output = max(files, key=lambda path: path.stat().st_mtime)
+        if output.stat().st_size > max_bytes:
+            output.unlink(missing_ok=True)
+            raise MediaError(
+                f"视频超过 {self.media_config.get('max_file_size_mb', 100)}MB 限制"
+            )
+        merged = dict(track)
+        merged.update(
+            {
+                "title": info.get("title") or track.get("title"),
+                "author": info.get("uploader") or track.get("author"),
+                "duration": int(info.get("duration") or track.get("duration") or 0),
+                "bvid": info.get("id") or track.get("bvid"),
+            }
+        )
+        return output, merged
+
+
+class NeteaseService:
+    """网易云公开搜索与试听音频下载；版权受限歌曲会返回链接。"""
+
+    def __init__(self, config: dict[str, Any], media_config: dict[str, Any]):
+        self.config = config
+        self.media_config = media_config
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://music.163.com/",
+            "Origin": "https://music.163.com",
+        }
+        if config.get("cookie"):
+            headers["Cookie"] = str(config["cookie"])
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=120), headers=headers
+        )
+
+    async def close(self) -> None:
+        if not self.session.closed:
+            await self.session.close()
+
+    async def search(self, query: str) -> list[dict[str, Any]]:
+        limit = max(1, min(20, int(self.config.get("search_count") or 5)))
+        params = {"s": query, "type": 1, "offset": 0, "limit": limit}
+        try:
+            async with self.session.get(NETEASE_SEARCH_API, params=params) as response:
+                response.raise_for_status()
+                data = await response.json(content_type=None)
+        except Exception as exc:
+            raise MediaError(f"网易云搜索失败: {exc}") from exc
+        songs = (data.get("result") or {}).get("songs") or []
+        tracks: list[dict[str, Any]] = []
+        for song in songs:
+            artists = song.get("artists") or song.get("ar") or []
+            author = " / ".join(item.get("name", "") for item in artists if item.get("name"))
+            song_id = str(song.get("id") or "")
+            if not song_id:
+                continue
+            tracks.append(
+                {
+                    "source": "netease",
+                    "id": song_id,
+                    "title": song.get("name") or song_id,
+                    "author": author or "未知",
+                    "duration": int((song.get("duration") or song.get("dt") or 0) / 1000),
+                    "url": f"{NETEASE_SONG_BASE}{song_id}",
+                }
+            )
+        if not tracks:
+            raise MediaError(f"网易云没有找到「{query}」")
+        return tracks
+
+    async def download(self, track: dict[str, Any]) -> Path:
+        song_id = _safe_filename(str(track["id"]), "netease")
+        existing = CACHE_DIR / f"netease_{song_id}.mp3"
+        if existing.exists() and existing.stat().st_size > 1024:
+            return existing
+        temp = existing.with_suffix(".mp3.part")
+        media_url = f"https://music.163.com/song/media/outer/url?id={song_id}.mp3"
+        max_bytes = max(1, int(self.media_config.get("max_file_size_mb") or 100)) * 1024 * 1024
+        try:
+            async with self.session.get(media_url, allow_redirects=True) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "text/html" in content_type or "application/json" in content_type:
+                    raise MediaError("该歌曲没有可用的公开试听音频")
+                written = 0
+                with temp.open("wb") as file:
+                    async for chunk in response.content.iter_chunked(256 * 1024):
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise MediaError(
+                                f"音频超过 {self.media_config.get('max_file_size_mb', 100)}MB 限制"
+                            )
+                        file.write(chunk)
+            if temp.stat().st_size <= 1024:
+                raise MediaError("该歌曲的试听音频为空，可能受版权限制")
+            os.replace(temp, existing)
+            return existing
+        except Exception as exc:
+            temp.unlink(missing_ok=True)
+            if isinstance(exc, MediaError):
+                raise
+            raise MediaError(f"网易云音频下载失败: {exc}") from exc
+
+    async def to_wav(self, source: Path, song_id: str) -> Path:
+        configured = str(self.media_config.get("ffmpeg_location") or "").strip()
+        ffmpeg = configured or shutil.which("ffmpeg")
+        if configured and Path(configured).is_dir():
+            ffmpeg = str(Path(configured) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"))
+        if not ffmpeg:
+            raise MediaError("send_mode=record 需要安装 ffmpeg，或填写 media.ffmpeg_location")
+        output = CACHE_DIR / f"netease_{_safe_filename(song_id)}.wav"
+        if output.exists() and output.stat().st_size > 1024:
+            return output
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-ac",
+            "1",
+            "-ar",
+            "24000",
+            str(output),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            output.unlink(missing_ok=True)
+            message = stderr.decode("utf-8", errors="ignore")[-300:]
+            raise MediaError(f"ffmpeg 转换音频失败: {message}")
+        return output
+
+
+@register("shuqu", "sakura", "B站/网易云术曲搜索、视频发送与每日推荐", "4.0.0")
+class ShuquPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-
-        self.db = SongDB(DB_PATH)
-
-        # ---- 读取配置 ----
-        cfg = load_plugin_config()
-        bili_cfg = cfg.get("bilibili", {})
-        push_cfg = cfg.get("push", {})
-
-        self.media_id = str(bili_cfg.get("media_id", "8745208"))
-        self.page_size = int(bili_cfg.get("page_size", 20))
-        self.target_groups = push_cfg.get("target_groups", [])
-        cron_hour = push_cfg.get("cron_hour", 12)
-        cron_minute = push_cfg.get("cron_minute", 0)
-
-        # ---- 定时器 ----
-        self.scheduler = AsyncIOScheduler()
-        self.scheduler.add_job(
-            self.scheduled_push, "cron", hour=cron_hour, minute=cron_minute
-        )
-        self.scheduler.start()
+        self.db = SongDB()
+        self.config = load_plugin_config()
+        self.bili_config = self.config["bilibili"]
+        self.netease_config = self.config["netease"]
+        self.media_config = self.config["media"]
+        self.push_config = self.config["push"]
+        self.bili_api: BiliAPI | None = None
+        self.bili_media = BiliMediaService(self.bili_config, self.media_config)
+        self.netease: NeteaseService | None = None
+        self.media_lock = asyncio.Lock()
+        self.scheduler = AsyncIOScheduler(timezone=self.push_config.get("timezone", "Asia/Shanghai"))
+        if self.push_config.get("enabled", True):
+            self.scheduler.add_job(
+                self.scheduled_push,
+                "cron",
+                hour=int(self.push_config.get("cron_hour", 12)),
+                minute=int(self.push_config.get("cron_minute", 0)),
+                id="shuqu_daily_push",
+                replace_existing=True,
+            )
 
     async def initialize(self) -> None:
-        """插件激活时初始化数据库"""
         await self.db.init()
-        logger.info(f"[jrsq] 数据库已初始化，当前曲库 {await self.db.count()} 首")
+        self.bili_api = BiliAPI(self.bili_config)
+        self.netease = NeteaseService(self.netease_config, self.media_config)
+        await asyncio.to_thread(self._cleanup_cache)
+        if self.push_config.get("enabled", True) and not self.scheduler.running:
+            self.scheduler.start()
+        logger.info("[shuqu] 初始化完成，曲库 %s 首", await self.db.count())
 
     async def terminate(self) -> None:
-        """插件卸载时清理资源"""
-        self.scheduler.shutdown(wait=False)
-        await BiliAPI.close_session()
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+        if self.bili_api:
+            await self.bili_api.close()
+        if self.netease:
+            await self.netease.close()
 
-    # ==================================================================
-    # 核心：随机推荐（返回视频）
-    # ==================================================================
-    async def _build_video_message(self, song: dict) -> MessageChain:
-        """
-        根据曲目信息构建消息链：
-          - 文本：🎵 标题 + 作者
-          - 视频：从 B站直链下载的 MP4
-        失败时降级为纯文本 + 链接。
-        """
-        text = (
-            f"🎵 今日术曲推荐：\n"
-            f"{song['title']}\n"
-            f"👤 UP主：{song.get('author', '未知')}"
+    def _cleanup_cache(self) -> None:
+        max_age = max(1, int(self.media_config.get("cache_hours") or 24)) * 3600
+        deadline = time.time() - max_age
+        for path in CACHE_DIR.iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < deadline:
+                    path.unlink()
+            except OSError as exc:
+                logger.warning("[shuqu] 清理缓存失败 %s: %s", path, exc)
+
+    def _duration_allowed(self, track: dict[str, Any]) -> bool:
+        duration = int(track.get("duration") or 0)
+        maximum = int(self.media_config.get("max_duration_seconds") or 0)
+        return not maximum or not duration or duration <= maximum
+
+    @staticmethod
+    def _bili_text(track: dict[str, Any], prefix: str = "🎵 术曲推荐") -> str:
+        return (
+            f"{prefix}\n{track.get('title', '未知标题')}\n"
+            f"👤 UP主：{track.get('author', '未知')}\n"
+            f"⏱️ {_format_duration(track.get('duration'))}\n"
+            f"🔗 {BILI_VIDEO_BASE}{track.get('bvid', '')}"
         )
 
-        try:
-            play_url = await BiliAPI.get_play_url(song["bvid"], song["cid"])
-        except Exception:
-            play_url = None
+    async def _bili_chain(self, track: dict[str, Any], prefix: str = "🎵 术曲推荐") -> list:
+        async with self.media_lock:
+            path, detail = await self.bili_media.download(track)
+        return [Plain(self._bili_text(detail, prefix)), Video.fromFileSystem(path=str(path))]
 
-        if play_url:
+    async def _netease_chain(self, track: dict[str, Any]) -> list:
+        if not self.netease:
+            raise MediaError("网易云服务尚未初始化")
+        text = (
+            f"🎧 网易云术曲\n{track['title']}\n"
+            f"👤 歌手：{track['author']}\n"
+            f"⏱️ {_format_duration(track.get('duration'))}\n"
+            f"🔗 {track['url']}"
+        )
+        mode = str(self.netease_config.get("send_mode") or "file").lower()
+        if mode == "link":
+            return [Plain(text)]
+        async with self.media_lock:
+            audio = await self.netease.download(track)
+            if mode == "record":
+                audio = await self.netease.to_wav(audio, str(track["id"]))
+                return [Plain(text), Record.fromFileSystem(path=str(audio))]
+        filename = f"{_safe_filename(track['title'])}.mp3"
+        return [Plain(text), File(file=str(audio), name=filename)]
+
+    async def _search_and_build(self, query: str, source: str | None = None) -> tuple[list, str]:
+        aliases = {
+            "bili": "bilibili",
+            "bilibili": "bilibili",
+            "b站": "bilibili",
+            "wy": "netease",
+            "163": "netease",
+            "netease": "netease",
+            "网易云": "netease",
+        }
+        if source:
+            sources = [aliases.get(source.lower(), source.lower())]
+        else:
+            sources = list(self.media_config.get("source_order") or ["bilibili", "netease"])
+        errors: list[str] = []
+        for current in sources:
             try:
-                return MessageChain([
-                    Plain(text),
-                    Video.fromURL(play_url),
-                ])
-            except Exception as e:
-                logger.warning(f"[jrsq] 视频发送失败，降级为链接: {e}")
+                if current == "bilibili" and self.bili_config.get("enabled", True):
+                    tracks = await self.bili_media.search(query)
+                    candidate_errors: list[str] = []
+                    for item in tracks:
+                        try:
+                            track = await self.bili_media.enrich(item)
+                            if not self._duration_allowed(track):
+                                candidate_errors.append(f"{track['title']} 超过时长限制")
+                                continue
+                            return await self._bili_chain(track, "🔎 找到术曲"), "B站"
+                        except Exception as exc:
+                            candidate_errors.append(str(exc))
+                    raise MediaError(
+                        "B站候选均不可发送: " + "；".join(candidate_errors[:3])
+                    )
+                if current == "netease" and self.netease_config.get("enabled", True):
+                    if not self.netease:
+                        raise MediaError("网易云服务尚未初始化")
+                    tracks = await self.netease.search(query)
+                    candidate_errors = []
+                    for track in tracks:
+                        if not self._duration_allowed(track):
+                            candidate_errors.append(f"{track['title']} 超过时长限制")
+                            continue
+                        try:
+                            return await self._netease_chain(track), "网易云"
+                        except Exception as exc:
+                            candidate_errors.append(str(exc))
+                    raise MediaError(
+                        "网易云候选均不可发送: " + "；".join(candidate_errors[:3])
+                    )
+            except Exception as exc:
+                message = str(exc)
+                errors.append(f"{current}: {message}")
+                logger.warning("[shuqu] %s 获取「%s」失败: %s", current, query, exc)
+        raise MediaError("；".join(errors) or "没有启用可用的音乐来源")
 
-        # 降级
-        return MessageChain([
-            Plain(text + f"\n🔗 {BILI_VIDEO_BASE}{song['bvid']}"),
-            Plain("\n⚠️ 视频直链获取失败，请点击链接观看"),
-        ])
-
-    # ==================================================================
-    # 指令：/jrsq
-    # ==================================================================
-    @filter.command("jrsq")
-    async def cmd_random(self, event: AstrMessageEvent):
-        """随机推荐一首术曲"""
-        try:
-            song = await self.db.random()
-            if song is None:
-                yield event.plain_result("😢 曲库为空，请先用 /jrsq favsync 同步或 /jrsq add 添加曲目。")
-                return
-
-            msg = await self._build_video_message(song)
-            yield event.chain_result([msg])
-        except Exception as e:
-            logger.error(f"[jrsq] 随机推荐异常: {e}", exc_info=True)
-            yield event.plain_result(f"😢 出了点问题: {e}")
-
-    # ==================================================================
-    # 指令：/jrsq list [页码]
-    # ==================================================================
-    @filter.command("jrsq list")
-    async def cmd_list(self, event: AstrMessageEvent):
-        """查看曲库列表（分页，每页 10 条）"""
-        try:
-            msg = event.message_str.strip()
-            page = 1
-            # 尝试提取页码，如 "/jrsq list 2"
-            parts = msg.split()
-            if len(parts) >= 3:
-                try:
-                    page = max(1, int(parts[2]))
-                except ValueError:
-                    pass
-
-            songs, total = await self.db.list_all(page=page, per_page=10)
-            if not songs:
-                yield event.plain_result("😢 曲库为空。")
-                return
-
-            total_pages = (total + 9) // 10
-            lines = [f"📋 曲库列表 ({total}首) [第{page}/{total_pages}页]"]
-            for s in songs:
-                dur = s.get("duration", 0)
-                dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "??:??"
-                lines.append(
-                    f"  [{s['id']}] {s['title']}  |  {dur_str}  |  {s['bvid']}"
-                )
-            if page < total_pages:
-                lines.append(f"👉 输入 /jrsq list {page + 1} 查看下一页")
-
-            yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            yield event.plain_result(f"😢 查询失败: {e}")
-
-    # ==================================================================
-    # 指令：/jrsq add <BV号>
-    # ==================================================================
-    @filter.command("jrsq add")
-    async def cmd_add(self, event: AstrMessageEvent):
-        """从 B站添加曲目，用法: /jrsq add BV1xx411c7m9"""
-        try:
-            parts = event.message_str.strip().split()
-            if len(parts) < 3:
-                yield event.plain_result("⚠️ 用法: /jrsq add <BV号>")
-                return
-
-            bvid = parts[2].strip()
-            if bvid.startswith("http"):
-                # 用户可能粘贴了完整链接
-                if "BV" in bvid:
-                    bvid = bvid[bvid.index("BV"):]
-                bvid = bvid.split("?")[0].split("/")[-1]
-
-            if not bvid.startswith("BV"):
-                yield event.plain_result("⚠️ 请输入有效的 BV 号（以 BV 开头）")
-                return
-
-            # 检查是否已存在
-            if await self.db.has_bvid(bvid):
-                yield event.plain_result(f"⚠️ {bvid} 已在曲库中。")
-                return
-
-            # 从 B站 获取详情
-            yield event.plain_result(f"🔍 正在获取 {bvid} 的信息...")
-
-            info = await BiliAPI.get_video_info(bvid)
-            if info is None:
-                yield event.plain_result(f"😢 无法获取 {bvid} 的信息，请检查 BV 号是否正确。")
-                return
-
-            await self.db.add(**info)
-            yield event.plain_result(
-                f"✅ 已添加: {info['title']}\n"
-                f"   UP主: {info['author']}  |  {info['duration'] // 60}:{info['duration'] % 60:02d}"
-            )
-        except Exception as e:
-            yield event.plain_result(f"😢 添加失败: {e}")
-
-    # ==================================================================
-    # 指令：/jrsq del <ID>
-    # ==================================================================
-    @filter.command("jrsq del")
-    async def cmd_delete(self, event: AstrMessageEvent):
-        """删除曲目，用法: /jrsq del 3"""
-        try:
-            parts = event.message_str.strip().split()
-            if len(parts) < 3:
-                yield event.plain_result("⚠️ 用法: /jrsq del <曲目ID>\n先用 /jrsq list 查看 ID")
-                return
-
-            song_id = int(parts[2])
-            ok = await self.db.delete(song_id)
-            if ok:
-                yield event.plain_result(f"✅ 已删除曲目 ID={song_id}")
-            else:
-                yield event.plain_result(f"😢 未找到 ID={song_id} 的曲目。")
-        except ValueError:
-            yield event.plain_result("⚠️ ID 必须是数字，请用 /jrsq list 查看。")
-        except Exception as e:
-            yield event.plain_result(f"😢 删除失败: {e}")
-
-    # ==================================================================
-    # 指令：/jrsq search <关键词>
-    # ==================================================================
-    @filter.command("jrsq search")
-    async def cmd_search(self, event: AstrMessageEvent):
-        """搜索曲目，用法: /jrsq search 深海"""
-        try:
-            msg = event.message_str.strip()
-            keyword = " ".join(msg.split()[2:]) if len(msg.split()) > 2 else ""
-            if not keyword:
-                yield event.plain_result("⚠️ 用法: /jrsq search <关键词>")
-                return
-
-            songs = await self.db.search(keyword)
-            if not songs:
-                yield event.plain_result(f"😢 未找到包含「{keyword}」的曲目。")
-                return
-
-            lines = [f"🔍 搜索「{keyword}」结果 ({len(songs)}首):"]
-            for s in songs:
-                dur = s.get("duration", 0)
-                dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "??:??"
-                lines.append(f"  [{s['id']}] {s['title']}  |  {dur_str}  |  {s['bvid']}")
-            yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            yield event.plain_result(f"😢 搜索失败: {e}")
-
-    # ==================================================================
-    # 指令：/jrsq favsync
-    # ==================================================================
-    @filter.command("jrsq favsync")
-    async def cmd_favsync(self, event: AstrMessageEvent):
-        """从 B站收藏夹同步新曲目到本地数据库"""
-        try:
-            yield event.plain_result(f"🔄 正在从收藏夹 (media_id={self.media_id}) 同步...")
-
-            # 拉取收藏夹全部视频
-            fav_videos = await BiliAPI.fetch_fav_all(self.media_id, self.page_size)
-            if not fav_videos:
-                yield event.plain_result(
-                    "😢 收藏夹为空或无法访问，请检查 media_id 是否正确。\n"
-                    "提示: 在 B站收藏夹页面 URL 中可找到 media_id"
-                )
-                return
-
-            # 去重
-            existing = await self.db.get_all_bvids()
-            new_count = 0
-            skip_count = 0
-            fail_count = 0
-
-            for v in fav_videos:
-                if v["bvid"] in existing:
-                    skip_count += 1
-                    continue
-                # 获取完整信息后写入
-                try:
-                    info = await BiliAPI.get_video_info(v["bvid"])
-                    if info:
-                        await self.db.add(**info)
-                        new_count += 1
-                    else:
-                        fail_count += 1
-                except Exception:
-                    fail_count += 1
-
-            total = await self.db.count()
-            yield event.plain_result(
-                f"✅ 同步完成！\n"
-                f"   📥 新增: {new_count} 首\n"
-                f"   ⏭️ 已存在: {skip_count} 首\n"
-                f"   ❌ 失败: {fail_count} 首\n"
-                f"   📊 曲库总计: {total} 首"
-            )
-        except Exception as e:
-            logger.error(f"[jrsq] 同步失败: {e}", exc_info=True)
-            yield event.plain_result(f"😢 同步失败: {e}")
-
-    # ==================================================================
-    # 指令：/jrsq count
-    # ==================================================================
-    @filter.command("jrsq count")
-    async def cmd_count(self, event: AstrMessageEvent):
-        """查看曲库曲目数"""
-        try:
-            cnt = await self.db.count()
-            yield event.plain_result(f"📊 曲库共有 {cnt} 首术曲。")
-        except Exception as e:
-            yield event.plain_result(f"😢 查询失败: {e}")
-
-    # ==================================================================
-    # 定时推送
-    # ==================================================================
-    async def scheduled_push(self):
-        """每天定时推送"""
-        song = await self.db.random()
-        if song is None:
-            logger.warning("[jrsq] 曲库为空，跳过定时推送。")
+    @filter.command("shuqu", alias={"jrsq"})
+    async def command_shuqu(self, event: AstrMessageEvent):
+        """搜索并发送术曲；发送 /shuqu help 查看全部用法。"""
+        parts = event.message_str.strip().split()
+        args = parts[1:]
+        if not args:
+            async for result in self._command_random(event):
+                yield result
             return
 
-        msg = await self._build_video_message(song)
+        action = args[0].lower()
+        handlers = {
+            "help": self._command_help,
+            "帮助": self._command_help,
+            "random": self._command_random,
+            "随机": self._command_random,
+            "list": self._command_list,
+            "列表": self._command_list,
+            "add": self._command_add,
+            "添加": self._command_add,
+            "del": self._command_delete,
+            "delete": self._command_delete,
+            "删除": self._command_delete,
+            "search": self._command_local_search,
+            "曲库搜索": self._command_local_search,
+            "sync": self._command_sync,
+            "favsync": self._command_sync,
+            "同步": self._command_sync,
+            "count": self._command_count,
+            "数量": self._command_count,
+            "bind": self._command_bind,
+            "绑定": self._command_bind,
+            "unbind": self._command_unbind,
+            "解绑": self._command_unbind,
+            "status": self._command_status,
+            "状态": self._command_status,
+        }
+        if action in handlers:
+            async for result in handlers[action](event, args[1:]):
+                yield result
+            return
 
-        for group_id in self.target_groups:
-            try:
-                gid = str(group_id).strip()
-                if not gid:
+        source_aliases = {"bili", "bilibili", "b站", "wy", "163", "netease", "网易云"}
+        source = action if action in source_aliases else None
+        query = " ".join(args[1:] if source else args).strip()
+        if not query:
+            yield event.plain_result("⚠️ 请提供术曲名，例如：/shuqu 千本樱")
+            return
+        yield event.plain_result(f"🔍 正在搜索「{query}」并准备媒体，请稍候...")
+        try:
+            chain, _ = await self._search_and_build(query, source)
+            yield event.chain_result(chain)
+        except Exception as exc:
+            logger.error("[shuqu] 指定曲目失败: %s", exc, exc_info=True)
+            yield event.plain_result(f"😢 没能获取「{query}」：{exc}")
+
+    async def _command_help(self, event: AstrMessageEvent, _args: list[str] | None = None):
+        yield event.plain_result(
+            "🎵 术曲插件指令\n"
+            "/shuqu <曲名>  B站优先，失败自动转网易云\n"
+            "/shuqu bili <曲名>  只从B站获取视频\n"
+            "/shuqu wy <曲名>  只从网易云获取音频\n"
+            "/shuqu random  从本地曲库随机发送视频\n"
+            "/shuqu list [页]  查看曲库\n"
+            "/shuqu search <词>  搜索本地曲库\n"
+            "/shuqu add <BV号或链接>  添加视频\n"
+            "/shuqu sync  同步配置的B站收藏夹\n"
+            "/shuqu del <ID>  删除曲库条目\n"
+            "/shuqu bind | unbind  绑定/解绑当前群的定时推送（管理员）\n"
+            "/shuqu status  查看来源、缓存和推送状态\n"
+            "旧指令 /jrsq 完全兼容。"
+        )
+
+    async def _command_random(self, event: AstrMessageEvent, _args: list[str] | None = None):
+        try:
+            song = await self.db.random()
+            if not song:
+                yield event.plain_result(
+                    "😢 曲库为空。可用 /shuqu sync 同步收藏夹，或直接输入 /shuqu 曲名。"
+                )
+                return
+            yield event.plain_result(f"🎲 抽到「{song['title']}」，正在准备视频...")
+            chain = await self._bili_chain(
+                {
+                    **song,
+                    "source": "bilibili",
+                    "url": f"{BILI_VIDEO_BASE}{song['bvid']}",
+                }
+            )
+            yield event.chain_result(chain)
+        except Exception as exc:
+            logger.error("[shuqu] 随机推荐失败: %s", exc, exc_info=True)
+            yield event.plain_result(f"😢 随机推荐失败: {exc}")
+
+    async def _command_list(self, event: AstrMessageEvent, args: list[str]):
+        try:
+            page = max(1, int(args[0])) if args else 1
+        except ValueError:
+            page = 1
+        songs, total = await self.db.list_all(page, 10)
+        if not songs:
+            yield event.plain_result("😢 当前页没有曲目。")
+            return
+        total_pages = max(1, math.ceil(total / 10))
+        lines = [f"📋 曲库共 {total} 首 [第 {page}/{total_pages} 页]"]
+        for song in songs:
+            lines.append(
+                f"[{song['id']}] {song['title']} | {_format_duration(song['duration'])} | {song['bvid']}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    async def _command_add(self, event: AstrMessageEvent, args: list[str]):
+        if not args:
+            yield event.plain_result("⚠️ 用法：/shuqu add <BV号或B站链接>")
+            return
+        bvid = _extract_bvid(" ".join(args))
+        if not bvid:
+            yield event.plain_result("⚠️ 没有识别到有效 BV 号。")
+            return
+        if await self.db.has_bvid(bvid):
+            yield event.plain_result(f"⚠️ {bvid} 已在曲库中。")
+            return
+        try:
+            if not self.bili_api:
+                raise MediaError("B站服务尚未初始化")
+            info = await self.bili_api.get_video_info(bvid)
+            if not info:
+                raise MediaError("B站未返回该视频的信息")
+            await self.db.add(**info)
+            yield event.plain_result(
+                f"✅ 已添加：{info['title']}\nUP主：{info['author']} | {_format_duration(info['duration'])}"
+            )
+        except Exception as exc:
+            yield event.plain_result(f"😢 添加失败: {exc}")
+
+    async def _command_delete(self, event: AstrMessageEvent, args: list[str]):
+        if not args:
+            yield event.plain_result("⚠️ 用法：/shuqu del <曲目ID>")
+            return
+        try:
+            song_id = int(args[0])
+            deleted = await self.db.delete(song_id)
+            yield event.plain_result(
+                f"✅ 已删除曲目 ID={song_id}" if deleted else f"😢 未找到 ID={song_id} 的曲目。"
+            )
+        except ValueError:
+            yield event.plain_result("⚠️ 曲目 ID 必须是数字。")
+
+    async def _command_local_search(self, event: AstrMessageEvent, args: list[str]):
+        keyword = " ".join(args).strip()
+        if not keyword:
+            yield event.plain_result("⚠️ 用法：/shuqu search <关键词>")
+            return
+        songs = await self.db.search(keyword)
+        if not songs:
+            yield event.plain_result(f"😢 本地曲库没有找到「{keyword}」。")
+            return
+        lines = [f"🔍 本地曲库「{keyword}」结果："]
+        for song in songs:
+            lines.append(
+                f"[{song['id']}] {song['title']} | {_format_duration(song['duration'])} | {song['bvid']}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    async def _command_sync(self, event: AstrMessageEvent, _args: list[str]):
+        media_id = str(self.bili_config.get("media_id") or "").strip()
+        if not media_id:
+            yield event.plain_result("⚠️ 请先在 data/plugin_config.json 填写 bilibili.media_id。")
+            return
+        if not self.bili_api:
+            yield event.plain_result("😢 B站服务尚未初始化。")
+            return
+        yield event.plain_result(f"🔄 正在同步 B站收藏夹 {media_id}...")
+        try:
+            videos = await self.bili_api.fetch_fav_all(
+                media_id, int(self.bili_config.get("page_size") or 20)
+            )
+            existing = await self.db.get_all_bvids()
+            added = skipped = failed = 0
+            for video in videos:
+                if video["bvid"] in existing:
+                    skipped += 1
                     continue
-                await self.context.send_message(target=gid, message=msg)
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                logger.error(f"[jrsq] 推送到群 {group_id} 失败: {e}")
+                try:
+                    info = await self.bili_api.get_video_info(video["bvid"])
+                    if info and await self.db.add(**info):
+                        added += 1
+                    else:
+                        failed += 1
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    failed += 1
+            yield event.plain_result(
+                f"✅ 同步完成：新增 {added}，已存在 {skipped}，失败 {failed}，"
+                f"曲库共 {await self.db.count()} 首。"
+            )
+        except Exception as exc:
+            logger.error("[shuqu] 收藏夹同步失败: %s", exc, exc_info=True)
+            yield event.plain_result(f"😢 同步失败: {exc}")
+
+    async def _command_count(self, event: AstrMessageEvent, _args: list[str]):
+        yield event.plain_result(f"📊 本地曲库共有 {await self.db.count()} 首术曲。")
+
+    @staticmethod
+    def _is_admin(event: AstrMessageEvent) -> bool:
+        return str(getattr(event, "role", "member")).lower() == "admin"
+
+    async def _command_bind(self, event: AstrMessageEvent, _args: list[str]):
+        if not self._is_admin(event):
+            yield event.plain_result("⛔ 只有 AstrBot 管理员可以修改定时推送目标。")
+            return
+        umo = str(event.unified_msg_origin)
+        targets = self.push_config.setdefault("target_umos", [])
+        if umo not in targets:
+            targets.append(umo)
+            save_plugin_config(self.config)
+        yield event.plain_result(f"✅ 已绑定当前会话的每日术曲推送：\n{umo}")
+
+    async def _command_unbind(self, event: AstrMessageEvent, _args: list[str]):
+        if not self._is_admin(event):
+            yield event.plain_result("⛔ 只有 AstrBot 管理员可以修改定时推送目标。")
+            return
+        umo = str(event.unified_msg_origin)
+        targets = self.push_config.setdefault("target_umos", [])
+        if umo in targets:
+            targets.remove(umo)
+            save_plugin_config(self.config)
+        yield event.plain_result("✅ 已取消当前会话的每日术曲推送。")
+
+    async def _command_status(self, event: AstrMessageEvent, _args: list[str]):
+        targets = self.push_config.get("target_umos") or []
+        cache_size = sum(path.stat().st_size for path in CACHE_DIR.glob("*") if path.is_file())
+        yield event.plain_result(
+            "⚙️ 术曲插件状态\n"
+            f"B站：{'开启' if self.bili_config.get('enabled', True) else '关闭'}\n"
+            f"网易云：{'开启' if self.netease_config.get('enabled', True) else '关闭'} "
+            f"({self.netease_config.get('send_mode', 'file')})\n"
+            f"来源顺序：{' → '.join(self.media_config.get('source_order') or [])}\n"
+            f"视频：≤{self.media_config.get('video_height', 480)}p，"
+            f"≤{self.media_config.get('max_file_size_mb', 100)}MB\n"
+            f"缓存：{cache_size / 1024 / 1024:.1f}MB\n"
+            f"定时推送：{'开启' if self.push_config.get('enabled', True) else '关闭'}，"
+            f"目标 {len(targets)} 个"
+        )
+
+    async def scheduled_push(self) -> None:
+        song = await self.db.random()
+        if not song:
+            logger.warning("[shuqu] 曲库为空，跳过定时推送")
+            return
+        targets = [
+            str(target).strip()
+            for target in (self.push_config.get("target_umos") or [])
+            if str(target).count(":") >= 2
+        ]
+        if not targets:
+            logger.info("[shuqu] 未绑定推送 UMO，跳过定时推送")
+            return
+        try:
+            components = await self._bili_chain(
+                {
+                    **song,
+                    "source": "bilibili",
+                    "url": f"{BILI_VIDEO_BASE}{song['bvid']}",
+                },
+                "🌞 每日术曲推荐",
+            )
+        except Exception as exc:
+            logger.error("[shuqu] 定时推送视频准备失败: %s", exc, exc_info=True)
+            components = [
+                Plain(self._bili_text(song, "🌞 每日术曲推荐") + f"\n⚠️ 视频准备失败：{exc}")
+            ]
+        for umo in targets:
+            try:
+                await self.context.send_message(umo, MessageChain(components))
+                await asyncio.sleep(1)
+            except Exception as exc:
+                logger.error("[shuqu] 推送到 %s 失败: %s", umo, exc)

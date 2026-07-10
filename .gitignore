@@ -1,4 +1,5 @@
 __pycache__/
 *.py[cod]
 *.db
+data/media_cache/
 .DS_Store
