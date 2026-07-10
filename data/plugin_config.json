@@ -5,19 +5,19 @@
     "page_size": 20,
     "search_count": 5,
     "search_suffix": "VOCALOID",
+    "default_query": "VOCALOID 术曲",
     "cookie": "",
     "cookies_file": ""
   },
   "netease": {
-    "enabled": true,
+    "enabled": false,
     "search_count": 5,
     "cookie": "",
     "send_mode": "file"
   },
   "media": {
     "source_order": [
-      "bilibili",
-      "netease"
+      "bilibili"
     ],
     "video_height": 480,
     "max_duration_seconds": 900,
@@ -31,6 +31,7 @@
     "cron_hour": 12,
     "cron_minute": 0,
     "timezone": "Asia/Shanghai",
+    "fallback_search_query": "VOCALOID 术曲",
     "target_umos": []
   }
 }

@@ -54,17 +54,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "page_size": 20,
         "search_count": 5,
         "search_suffix": "VOCALOID",
+        "default_query": "VOCALOID 术曲",
         "cookie": "",
         "cookies_file": "",
     },
     "netease": {
-        "enabled": True,
+        "enabled": False,
         "search_count": 5,
         "cookie": "",
         "send_mode": "file",
     },
     "media": {
-        "source_order": ["bilibili", "netease"],
+        "source_order": ["bilibili"],
         "video_height": 480,
         "max_duration_seconds": 900,
         "max_file_size_mb": 100,
@@ -77,6 +78,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cron_hour": 12,
         "cron_minute": 0,
         "timezone": "Asia/Shanghai",
+        "fallback_search_query": "VOCALOID 术曲",
         "target_umos": [],
     },
 }
@@ -736,8 +738,8 @@ class NeteaseService:
         return output
 
 
-@register("shuqu", "sakura", "B站/网易云术曲搜索、视频发送与每日推荐", "4.0.0")
-class ShuquPlugin(Star):
+@register("jrsq", "sakura", "每日术曲：B站视频搜索、完整视频发送与定时推送", "4.1.0")
+class JRSQPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.db = SongDB()
@@ -798,8 +800,7 @@ class ShuquPlugin(Star):
         return (
             f"{prefix}\n{track.get('title', '未知标题')}\n"
             f"👤 UP主：{track.get('author', '未知')}\n"
-            f"⏱️ {_format_duration(track.get('duration'))}\n"
-            f"🔗 {BILI_VIDEO_BASE}{track.get('bvid', '')}"
+            f"⏱️ {_format_duration(track.get('duration'))}"
         )
 
     async def _bili_chain(self, track: dict[str, Any], prefix: str = "🎵 术曲推荐") -> list:
@@ -827,7 +828,12 @@ class ShuquPlugin(Star):
         filename = f"{_safe_filename(track['title'])}.mp3"
         return [Plain(text), File(file=str(audio), name=filename)]
 
-    async def _search_and_build(self, query: str, source: str | None = None) -> tuple[list, str]:
+    async def _search_and_build(
+        self,
+        query: str,
+        source: str | None = None,
+        prefix: str = "🔎 找到术曲",
+    ) -> tuple[list, str]:
         aliases = {
             "bili": "bilibili",
             "bilibili": "bilibili",
@@ -853,7 +859,7 @@ class ShuquPlugin(Star):
                             if not self._duration_allowed(track):
                                 candidate_errors.append(f"{track['title']} 超过时长限制")
                                 continue
-                            return await self._bili_chain(track, "🔎 找到术曲"), "B站"
+                            return await self._bili_chain(track, prefix), "B站"
                         except Exception as exc:
                             candidate_errors.append(str(exc))
                     raise MediaError(
@@ -881,9 +887,9 @@ class ShuquPlugin(Star):
                 logger.warning("[shuqu] %s 获取「%s」失败: %s", current, query, exc)
         raise MediaError("；".join(errors) or "没有启用可用的音乐来源")
 
-    @filter.command("shuqu", alias={"jrsq"})
-    async def command_shuqu(self, event: AstrMessageEvent):
-        """搜索并发送术曲；发送 /shuqu help 查看全部用法。"""
+    @filter.command("jrsq", alias={"shuqu"})
+    async def command_jrsq(self, event: AstrMessageEvent):
+        """每日术曲：搜索 B站并发送完整视频；/jrsq help 查看用法。"""
         parts = event.message_str.strip().split()
         args = parts[1:]
         if not args:
@@ -927,7 +933,7 @@ class ShuquPlugin(Star):
         source = action if action in source_aliases else None
         query = " ".join(args[1:] if source else args).strip()
         if not query:
-            yield event.plain_result("⚠️ 请提供术曲名，例如：/shuqu 千本樱")
+            yield event.plain_result("⚠️ 请提供术曲名，例如：/jrsq 千本樱")
             return
         yield event.plain_result(f"🔍 正在搜索「{query}」并准备媒体，请稍候...")
         try:
@@ -939,28 +945,28 @@ class ShuquPlugin(Star):
 
     async def _command_help(self, event: AstrMessageEvent, _args: list[str] | None = None):
         yield event.plain_result(
-            "🎵 术曲插件指令\n"
-            "/shuqu <曲名>  B站优先，失败自动转网易云\n"
-            "/shuqu bili <曲名>  只从B站获取视频\n"
-            "/shuqu wy <曲名>  只从网易云获取音频\n"
-            "/shuqu random  从本地曲库随机发送视频\n"
-            "/shuqu list [页]  查看曲库\n"
-            "/shuqu search <词>  搜索本地曲库\n"
-            "/shuqu add <BV号或链接>  添加视频\n"
-            "/shuqu sync  同步配置的B站收藏夹\n"
-            "/shuqu del <ID>  删除曲库条目\n"
-            "/shuqu bind | unbind  绑定/解绑当前群的定时推送（管理员）\n"
-            "/shuqu status  查看来源、缓存和推送状态\n"
-            "旧指令 /jrsq 完全兼容。"
+            "🎵 今日术曲指令\n"
+            "/jrsq <曲名>  去B站搜索、下载并发送完整视频\n"
+            "/jrsq  随机推荐；曲库为空时自动联网搜索\n"
+            "/jrsq random  从本地曲库随机发送B站视频\n"
+            "/jrsq list [页]  查看曲库\n"
+            "/jrsq search <词>  搜索本地曲库\n"
+            "/jrsq add <BV号或链接>  添加视频\n"
+            "/jrsq sync  同步配置的B站收藏夹\n"
+            "/jrsq del <ID>  删除曲库条目\n"
+            "/jrsq bind | unbind  绑定/解绑当前群的每日推送（管理员）\n"
+            "/jrsq status  查看视频、缓存和推送状态\n"
+            "兼容别名：/shuqu。网易云为可选扩展，默认关闭。"
         )
 
     async def _command_random(self, event: AstrMessageEvent, _args: list[str] | None = None):
         try:
             song = await self.db.random()
             if not song:
-                yield event.plain_result(
-                    "😢 曲库为空。可用 /shuqu sync 同步收藏夹，或直接输入 /shuqu 曲名。"
-                )
+                query = str(self.bili_config.get("default_query") or "VOCALOID 术曲")
+                yield event.plain_result(f"🔍 曲库为空，正在从B站搜索「{query}」并下载视频...")
+                chain, _ = await self._search_and_build(query, "bilibili")
+                yield event.chain_result(chain)
                 return
             yield event.plain_result(f"🎲 抽到「{song['title']}」，正在准备视频...")
             chain = await self._bili_chain(
@@ -1127,32 +1133,39 @@ class ShuquPlugin(Star):
         )
 
     async def scheduled_push(self) -> None:
-        song = await self.db.random()
-        if not song:
-            logger.warning("[shuqu] 曲库为空，跳过定时推送")
-            return
         targets = [
             str(target).strip()
             for target in (self.push_config.get("target_umos") or [])
             if str(target).count(":") >= 2
         ]
         if not targets:
-            logger.info("[shuqu] 未绑定推送 UMO，跳过定时推送")
+            logger.info("[jrsq] 未绑定推送 UMO，跳过定时推送")
             return
         try:
-            components = await self._bili_chain(
-                {
-                    **song,
-                    "source": "bilibili",
-                    "url": f"{BILI_VIDEO_BASE}{song['bvid']}",
-                },
-                "🌞 每日术曲推荐",
-            )
+            song = await self.db.random()
+            if song:
+                components = await self._bili_chain(
+                    {
+                        **song,
+                        "source": "bilibili",
+                        "url": f"{BILI_VIDEO_BASE}{song['bvid']}",
+                    },
+                    "🌞 每日术曲推荐",
+                )
+            else:
+                query = str(
+                    self.push_config.get("fallback_search_query")
+                    or self.bili_config.get("default_query")
+                    or "VOCALOID 术曲"
+                )
+                components, _ = await self._search_and_build(
+                    query,
+                    "bilibili",
+                    "🌞 每日术曲推荐",
+                )
         except Exception as exc:
-            logger.error("[shuqu] 定时推送视频准备失败: %s", exc, exc_info=True)
-            components = [
-                Plain(self._bili_text(song, "🌞 每日术曲推荐") + f"\n⚠️ 视频准备失败：{exc}")
-            ]
+            logger.error("[jrsq] 定时推送视频准备失败，不发送链接: %s", exc, exc_info=True)
+            return
         for umo in targets:
             try:
                 await self.context.send_message(umo, MessageChain(components))

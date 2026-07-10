@@ -8,45 +8,44 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-AstrBot 每日术曲插件。可以按曲名从 B站搜索并下载视频，再由 AstrBot 以视频消息发送到当前群；B站失败时可自动转到网易云，发送试听音频文件或歌曲链接。插件同时保留 B站收藏夹曲库、随机推荐和定时群推送。
+AstrBot 每日术曲视频推送插件。
 
-## 功能
+核心功能是 `/jrsq`：机器人自动到 B站搜索术曲，下载完整 MP4，再通过 AstrBot 的 `Video` 消息段把整个视频发送到群里。成功结果不是网页链接，也不是链接预览。
 
-- `/shuqu 千本樱`：按名称搜索，默认按照“B站 → 网易云”的顺序获取
-- B站视频由 `yt-dlp` 下载到本地缓存，再使用 AstrBot `Video` 消息段发送
-- `/shuqu bili 曲名` 和 `/shuqu wy 曲名`：指定来源
-- 网易云支持音频文件、WAV 语音或链接三种模式
-- 从公开 B站收藏夹同步本地 SQLite 曲库
-- 从本地曲库随机发送视频、搜索、分页、添加和删除
-- 管理员可在群内一键绑定每日定时推送，无需手写群号
-- 视频获取失败会返回原站链接和明确错误，不会静默失败
-- 自动限制视频分辨率、时长、文件大小，并定期清理媒体缓存
-- 兼容旧入口 `/jrsq`
+## 核心功能
+
+- `/jrsq <术曲名>`：自动搜索 B站、下载并发送完整视频
+- `/jrsq`：从曲库随机推荐；曲库为空时自动联网搜索 B站
+- 每天定时向已绑定的群推送一首完整术曲视频
+- 可从 B站公开收藏夹同步本地曲库
+- B站 JSON 搜索遇到 412 风控时自动改用搜索网页解析
+- 优先获取带声音的单文件 MP4；需要时可通过 ffmpeg 合并音视频
+- 限制视频分辨率、时长和大小，并自动清理缓存
+- 下载或视频准备失败时只记录错误，不用链接冒充视频结果
+
+网易云功能仍然保留，但属于可选扩展，默认关闭，不影响 `/jrsq` 的 B站视频主流程。
 
 ## 指令
 
 | 指令 | 说明 | 示例 |
 |---|---|---|
-| `/shuqu <曲名>` | B站优先搜索，失败自动转网易云 | `/shuqu 世界第一公主殿下` |
-| `/shuqu bili <曲名>` | 只从 B站拉取视频 | `/shuqu bili 千本樱` |
-| `/shuqu wy <曲名>` | 只从网易云拉取音频 | `/shuqu wy 神っぽいな` |
-| `/shuqu random` | 从收藏夹曲库随机发送 B站视频 | `/shuqu random` |
-| `/shuqu list [页]` | 分页查看本地曲库 | `/shuqu list 2` |
-| `/shuqu search <词>` | 只搜索本地曲库，不联网 | `/shuqu search 初音` |
-| `/shuqu add <BV号或链接>` | 添加一个 B站视频到曲库 | `/shuqu add BV1xx411c7m9` |
-| `/shuqu del <ID>` | 按曲库 ID 删除 | `/shuqu del 3` |
-| `/shuqu sync` | 同步配置的 B站收藏夹 | `/shuqu sync` |
-| `/shuqu count` | 查看本地曲库数量 | `/shuqu count` |
-| `/shuqu bind` | 管理员绑定当前群的每日推送 | `/shuqu bind` |
-| `/shuqu unbind` | 管理员解绑当前群 | `/shuqu unbind` |
-| `/shuqu status` | 查看来源、缓存和推送状态 | `/shuqu status` |
-| `/shuqu help` | 显示插件帮助 | `/shuqu help` |
+| `/jrsq <曲名>` | 从 B站查找并发送完整视频 | `/jrsq 千本樱` |
+| `/jrsq` | 随机推荐；空曲库时自动联网搜索 | `/jrsq` |
+| `/jrsq random` | 从本地曲库随机发送视频 | `/jrsq random` |
+| `/jrsq list [页]` | 分页查看本地曲库 | `/jrsq list 2` |
+| `/jrsq search <词>` | 搜索本地曲库 | `/jrsq search 初音` |
+| `/jrsq add <BV号或链接>` | 添加 B站视频到曲库 | `/jrsq add BV1xx411c7m9` |
+| `/jrsq del <ID>` | 删除曲库条目 | `/jrsq del 3` |
+| `/jrsq sync` | 同步配置的 B站收藏夹 | `/jrsq sync` |
+| `/jrsq count` | 查看曲库数量 | `/jrsq count` |
+| `/jrsq bind` | 管理员绑定当前群的每日推送 | `/jrsq bind` |
+| `/jrsq unbind` | 管理员解绑当前群 | `/jrsq unbind` |
+| `/jrsq status` | 查看视频、缓存和推送状态 | `/jrsq status` |
+| `/jrsq help` | 查看帮助 | `/jrsq help` |
 
-以上命令均可将 `/shuqu` 换成 `/jrsq`。
+兼容别名 `/shuqu`，但项目主命令是 `/jrsq`。
 
 ## 安装
-
-在 AstrBot 的插件目录中克隆并安装依赖：
 
 ```bash
 cd data/plugins
@@ -55,18 +54,13 @@ cd astrbot-plugin-vocadaily
 pip install -r requirements.txt
 ```
 
-然后重启 AstrBot 或在 WebUI 中重载插件。
+重启 AstrBot 或在 WebUI 中重载插件。
 
-插件需要 AstrBot `4.25.0+`。B站视频搜索和下载依赖 `yt-dlp`。只有在以下场景需要额外安装 `ffmpeg`：
+插件要求 AstrBot `4.25.0+`，B站搜索与下载依赖 `yt-dlp`。建议安装 `ffmpeg`，用于合并 B站提供的 DASH 音视频流；没有 ffmpeg 时，插件会优先请求游客可用的带声音单文件 MP4。
 
-- B站只提供音视频分离的 DASH 流，需要合并为 MP4；
-- 将 `netease.send_mode` 设置成 `record`，需要把网易云音频转成 AstrBot 文档要求的 WAV。
+## 基础配置
 
-建议服务器安装 `ffmpeg`。如果它不在系统 `PATH` 中，可在配置的 `media.ffmpeg_location` 填可执行文件或所在目录。
-
-## 配置
-
-配置文件为 `data/plugin_config.json`：
+配置文件：`data/plugin_config.json`。
 
 ```json
 {
@@ -76,17 +70,18 @@ pip install -r requirements.txt
     "page_size": 20,
     "search_count": 5,
     "search_suffix": "VOCALOID",
+    "default_query": "VOCALOID 术曲",
     "cookie": "",
     "cookies_file": ""
   },
   "netease": {
-    "enabled": true,
+    "enabled": false,
     "search_count": 5,
     "cookie": "",
     "send_mode": "file"
   },
   "media": {
-    "source_order": ["bilibili", "netease"],
+    "source_order": ["bilibili"],
     "video_height": 480,
     "max_duration_seconds": 900,
     "max_file_size_mb": 100,
@@ -99,84 +94,85 @@ pip install -r requirements.txt
     "cron_hour": 12,
     "cron_minute": 0,
     "timezone": "Asia/Shanghai",
+    "fallback_search_query": "VOCALOID 术曲",
     "target_umos": []
   }
 }
 ```
 
-### B站
+### B站配置
 
 | 字段 | 说明 |
 |---|---|
-| `enabled` | 是否允许 B站搜索和下载 |
-| `media_id` | 要同步的收藏夹 ID；只按名称搜索时可以留空 |
-| `page_size` | 收藏夹每页读取数量 |
-| `search_count` | 每次名称搜索读取的候选数，插件发送第一个满足限制的结果 |
-| `search_suffix` | 自动附加到搜索词后的限定词；默认 `VOCALOID`，可改成 `术曲` 或留空 |
-| `cookie` | 可选的完整 Cookie 请求头，用于登录可见内容和降低风控概率 |
-| `cookies_file` | 可选的 Netscape 格式 Cookie 文件路径；相对路径从插件目录开始 |
+| `media_id` | 用于同步曲库的公开收藏夹 ID；只使用搜索功能时可留空 |
+| `search_count` | 每次搜索检查的 B站候选数量 |
+| `search_suffix` | 自动添加到用户曲名后的搜索限定词 |
+| `default_query` | `/jrsq` 在曲库为空时使用的联网搜索词 |
+| `cookie` | 可选 B站 Cookie，用于登录可见内容并降低风控概率 |
+| `cookies_file` | 可选 Netscape 格式 Cookie 文件路径 |
 
-收藏夹页面 URL 形如：
+收藏夹 URL 形如：
 
 ```text
 https://space.bilibili.com/用户ID/favlist?fid=收藏夹ID
 ```
 
-将 `fid=` 后的数字填到 `media_id`。收藏夹必须公开，私密收藏夹需要配置有效 Cookie。
+将 `fid=` 后的数字填入 `media_id`，然后执行 `/jrsq sync`。
 
-### 网易云
-
-`send_mode` 支持：
-
-- `file`：默认，下载公开试听 MP3 并作为文件消息发送；不要求 ffmpeg。
-- `record`：转成 WAV 后作为语音消息发送；要求 ffmpeg，且 WAV 文件通常更大。
-- `link`：只发送歌曲信息和网易云链接，不下载音频。
-
-部分付费、VIP、无版权或区域受限歌曲没有公开试听地址。遇到这种情况插件会返回歌曲链接；配置 Cookie 也不保证能够突破版权限制。
-
-### 媒体限制
+### 视频配置
 
 | 字段 | 说明 |
 |---|---|
-| `source_order` | `/shuqu 曲名` 的来源尝试顺序，可改成只包含一个来源 |
-| `video_height` | B站下载的目标最高高度，群聊建议 360 或 480 |
-| `max_duration_seconds` | 最大时长；设为 `0` 表示不限制 |
-| `max_file_size_mb` | 下载和发送的最大文件大小 |
-| `cache_hours` | 本地媒体缓存保留小时数 |
+| `video_height` | 视频最高高度，群聊建议 360 或 480 |
+| `max_duration_seconds` | 最大视频时长；`0` 表示不限 |
+| `max_file_size_mb` | 最大下载和发送大小 |
+| `cache_hours` | 视频缓存保留时间 |
 | `ffmpeg_location` | ffmpeg 可执行文件或目录；已加入 PATH 时留空 |
-| `proxy` | yt-dlp 使用的代理，例如 `http://127.0.0.1:7890` |
+| `proxy` | yt-dlp 代理，例如 `http://127.0.0.1:7890` |
 
-缓存位于 `data/media_cache/`，过期文件会在插件启动时自动清理。
+视频缓存在 `data/media_cache/`，过期文件会在插件启动时清理。
 
-## 定时推送
+## 每日自动推送
 
-不要只在配置里填写裸群号。AstrBot 主动消息需要 UMO（Unified Message Origin），格式类似：
+AstrBot 主动发送消息需要完整的 UMO，不能只填写裸群号。UMO 类似：
 
 ```text
 aiocqhttp:GroupMessage:123456789
 ```
 
-最简单且不容易填错的方式：在目标群里用 AstrBot 管理员账号发送：
+在目标群里使用 AstrBot 管理员账号执行：
 
 ```text
-/shuqu bind
+/jrsq bind
 ```
 
-插件会把当前会话的完整 UMO 写入 `push.target_umos`。发送 `/shuqu unbind` 可解绑。也可以先在群里执行 AstrBot 自带的 `/sid`，再手动复制 UMO 到配置中。
+插件会自动把当前群的 UMO 写入 `push.target_umos`。取消推送使用 `/jrsq unbind`。
 
-修改 `cron_hour`、`cron_minute` 或 `timezone` 后需要重载插件。
+每天到达配置时间后：
 
-## 媒体发送说明
+1. 曲库有内容：随机选取一条 B站视频记录。
+2. 曲库为空：使用 `fallback_search_query` 自动搜索 B站。
+3. 下载完整视频并构造 AstrBot `Video.fromFileSystem(...)` 消息。
+4. 向所有绑定群发送视频。
+5. 视频准备失败：本次不发送，不降级成链接。
 
-插件先把 B站视频下载到 AstrBot 所在机器，再构造 `Video.fromFileSystem(...)` 消息。这能避免 B站临时直链因缺少 Referer/Cookie 而被消息平台下载时报 403。
+## 为什么先下载再发送
 
-本地媒体能否成功发送仍取决于具体平台适配器：
+B站临时播放地址通常要求正确的 Referer、Cookie 等请求头。直接把临时 URL 交给聊天平台，平台再次下载时容易出现 403。
 
-- OneBot/NapCat 与 AstrBot 不在同一台机器时，需要正确共享或映射本地文件路径；
-- 部分平台不支持视频、文件或主动消息；
-- QQ 等平台还会限制文件大小、编码格式和上传频率。
+插件会先把 MP4 下载到 AstrBot 所在机器，再让 AstrBot 发送本地视频文件，因此群里收到的是完整视频消息。
 
-若适配器不接受本地文件，请让协议端与 AstrBot 共享 `data/media_cache/`，或按适配器文档设置路径映射。
+如果 OneBot/NapCat 和 AstrBot 不在同一台机器，需要让协议端能够访问 `data/media_cache/`，或按照平台适配器文档配置共享路径。
+
+## 可选网易云扩展
+
+网易云默认关闭。只有确实需要音频兜底时，才将：
+
+```json
+"netease": { "enabled": true }
+```
+
+并把 `media.source_order` 改成 `["bilibili", "netease"]`。这不会改变 `/jrsq <曲名>` 优先获取 B站完整视频的行为。
 
 ## 项目结构
 
@@ -185,18 +181,18 @@ astrbot-plugin-vocadaily/
 ├── main.py
 ├── manifest.json
 ├── requirements.txt
-├── shuqu-avatar.png       # 项目头像
+├── shuqu-avatar.png
 ├── jsrqmiku.png
 ├── README.md
 └── data/
     ├── plugin_config.json
     ├── jrsq.db
-    └── media_cache/       # 自动生成，不提交到 Git
+    └── media_cache/
 ```
 
 ## 注意
 
-本插件只用于个人学习和自有群聊。请遵守 B站、网易云音乐及消息平台的服务条款，不要绕过付费、版权、地区限制或批量传播受保护内容。
+本插件只用于个人学习和自有群聊。请遵守 B站及消息平台的服务条款，不要绕过付费、版权或地区限制传播受保护内容。
 
 ## License
 
