@@ -15,7 +15,8 @@ AstrBot 每日术曲视频推送插件。
 ## 核心功能
 
 - `/jrsq <术曲名>`：自动搜索 B站、下载并发送完整视频
-- `/jrsq`：从曲库随机推荐；曲库为空时自动联网搜索 B站
+- `/jrsq`：从曲库随机推荐；曲库为空时从可配置的每日曲目池抽取
+- 精确匹配曲名，优先官方、本家、原曲与原创投稿，过滤翻唱、手书、恐怖、合集等非原曲候选
 - 每天定时向已绑定的群推送一首完整术曲视频
 - 可从 B站公开收藏夹同步本地曲库
 - B站 JSON 搜索遇到 412 风控时自动改用搜索网页解析
@@ -71,6 +72,8 @@ pip install -r requirements.txt
     "search_count": 10,
     "search_suffix": "VOCALOID 原曲 MV",
     "default_query": "术曲",
+    "apex_host_fallback": true,
+    "search_min_score": 100,
     "cookie": "",
     "cookies_file": ""
   },
@@ -82,7 +85,7 @@ pip install -r requirements.txt
   },
   "media": {
     "source_order": ["bilibili"],
-    "video_height": 480,
+    "video_height": 360,
     "max_duration_seconds": 900,
     "max_file_size_mb": 100,
     "cache_hours": 24,
@@ -95,6 +98,7 @@ pip install -r requirements.txt
     "cron_minute": 0,
     "timezone": "Asia/Shanghai",
     "fallback_search_query": "术曲",
+    "daily_queries": ["千本樱", "天ノ弱", "メルト", "深海少女", "ロキ"],
     "target_umos": []
   }
 }
@@ -108,6 +112,8 @@ pip install -r requirements.txt
 | `search_count` | 每次搜索检查的 B站候选数量 |
 | `search_suffix` | 自动添加到用户曲名后的搜索限定词 |
 | `default_query` | `/jrsq` 在曲库为空时使用的联网搜索词 |
+| `apex_host_fallback` | 子域名 TLS 被重置时，通过 `bilibili.com` 顶级域名路由 API、搜索页和视频 CDN |
+| `search_min_score` | 原曲候选最低可信分；默认 `100`，越高越严格 |
 | `cookie` | 可选 B站 Cookie，用于登录可见内容并降低风控概率 |
 | `cookies_file` | 可选 Netscape 格式 Cookie 文件路径 |
 
@@ -151,8 +157,8 @@ aiocqhttp:GroupMessage:123456789
 每天到达配置时间后：
 
 1. 曲库有内容：随机选取一条 B站视频记录。
-2. 曲库为空：使用 `fallback_search_query` 自动搜索 B站，并从候选结果中随机选择，避免每天重复同一个视频。
-3. 下载完整视频并构造 AstrBot `Video.fromFileSystem(...)` 消息。
+2. 曲库为空：从 `daily_queries` 随机抽取一个明确曲名，再按曲名精确匹配并优先下载官方/本家投稿。
+3. 下载完整视频，使用标准 Windows `file:///C:/...` URI 构造独立的 AstrBot `Video` 消息。
 4. 向所有绑定群发送视频。
 5. 视频准备失败：本次不发送，不降级成链接。
 

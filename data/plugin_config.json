@@ -6,6 +6,8 @@
     "search_count": 10,
     "search_suffix": "VOCALOID 原曲 MV",
     "default_query": "术曲",
+    "apex_host_fallback": true,
+    "search_min_score": 100,
     "cookie": "",
     "cookies_file": ""
   },
@@ -19,7 +21,7 @@
     "source_order": [
       "bilibili"
     ],
-    "video_height": 480,
+    "video_height": 360,
     "max_duration_seconds": 900,
     "max_file_size_mb": 100,
     "cache_hours": 24,
@@ -32,6 +34,23 @@
     "cron_minute": 0,
     "timezone": "Asia/Shanghai",
     "fallback_search_query": "术曲",
+    "daily_queries": [
+      "千本樱",
+      "天ノ弱",
+      "メルト",
+      "深海少女",
+      "ロミオとシンデレラ",
+      "六兆年と一夜物語",
+      "ヒバナ",
+      "ゴーストルール",
+      "砂の惑星",
+      "少女レイ",
+      "ラグトレイン",
+      "神っぽいな",
+      "ロキ",
+      "乙女解剖",
+      "強風オールバック"
+    ],
     "target_umos": []
   }
 }

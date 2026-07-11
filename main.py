@@ -9,9 +9,13 @@ import os
 import random
 import re
 import shutil
+import socket
+import ssl
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import aiosqlite
@@ -38,6 +42,8 @@ CACHE_DIR = DATA_DIR / "media_cache"
 BILI_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
 BILI_FAV_API = "https://api.bilibili.com/x/v3/fav/resource/list"
 BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl"
+BILI_TAGS_API = "https://api.bilibili.com/x/tag/archive/tags"
+BILI_SEARCH_API = "https://api.bilibili.com/x/web-interface/search/type"
 BILI_SEARCH_PAGE = "https://search.bilibili.com/all"
 BILI_VIDEO_BASE = "https://www.bilibili.com/video/"
 NETEASE_SEARCH_API = "https://music.163.com/api/search/get"
@@ -57,6 +63,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "search_count": 10,
         "search_suffix": "VOCALOID 原曲 MV",
         "default_query": "术曲",
+        "apex_host_fallback": True,
+        "search_min_score": 100,
         "cookie": "",
         "cookies_file": "",
     },
@@ -68,7 +76,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "media": {
         "source_order": ["bilibili"],
-        "video_height": 480,
+        "video_height": 360,
         "max_duration_seconds": 900,
         "max_file_size_mb": 100,
         "cache_hours": 24,
@@ -81,6 +89,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cron_minute": 0,
         "timezone": "Asia/Shanghai",
         "fallback_search_query": "术曲",
+        "daily_queries": [
+            "千本樱",
+            "天ノ弱",
+            "メルト",
+            "深海少女",
+            "ロミオとシンデレラ",
+            "六兆年と一夜物語",
+            "ヒバナ",
+            "ゴーストルール",
+            "砂の惑星",
+            "少女レイ",
+            "ラグトレイン",
+            "神っぽいな",
+            "ロキ",
+            "乙女解剖",
+            "強風オールバック",
+        ],
         "target_umos": [],
     },
 }
@@ -91,6 +116,41 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 class MediaError(RuntimeError):
     """可直接显示给用户的媒体检索或下载错误。"""
+
+
+class _FixedResolver(aiohttp.abc.AbstractResolver):
+    """Resolve one synthetic request host to a selected CDN address."""
+
+    def __init__(self, ip_address: str):
+        self.ip_address = ip_address
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "hostname": host,
+                "host": self.ip_address,
+                "port": port,
+                "family": socket.AF_INET,
+                "proto": 0,
+                "flags": 0,
+            }
+        ]
+
+    async def close(self) -> None:
+        return None
+
+
+def _apex_routed_url(url: str, enabled: bool) -> tuple[str, dict[str, str]]:
+    """Use bilibili.com for TLS SNI while retaining the original HTTP Host."""
+    if not enabled:
+        return url, {}
+    parts = urlsplit(url)
+    routed = urlunsplit(
+        (parts.scheme, "bilibili.com", parts.path, parts.query, parts.fragment)
+    )
+    return routed, {"Host": parts.hostname or "api.bilibili.com"}
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -140,6 +200,12 @@ def _format_duration(seconds: int | float | None) -> str:
 def _extract_bvid(value: str) -> str | None:
     match = re.search(r"BV[0-9A-Za-z]{10}", value, re.IGNORECASE)
     return match.group(0) if match else None
+
+
+def _normalize_search_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value).lower()
+    value = value.translate(str.maketrans({"桜": "樱", "櫻": "樱", "臺": "台"}))
+    return re.sub(r"[^0-9a-z\u3040-\u30ff\u3400-\u9fff]+", "", value)
 
 
 class SongDB:
@@ -255,7 +321,12 @@ class BiliAPI:
             await self.session.close()
 
     async def _json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
-        async with self.session.get(url, params=params) as response:
+        request_url, route_headers = _apex_routed_url(
+            url, bool(self.config.get("apex_host_fallback"))
+        )
+        async with self.session.get(
+            request_url, params=params, headers=route_headers
+        ) as response:
             response.raise_for_status()
             return await response.json(content_type=None)
 
@@ -354,15 +425,32 @@ class BiliMediaService:
         headers = {"User-Agent": UA, "Referer": f"{BILI_VIDEO_BASE}{bvid}"}
         if self.bili_config.get("cookie"):
             headers["Cookie"] = str(self.bili_config["cookie"])
+        request_url, route_headers = _apex_routed_url(
+            BILI_VIEW_API, bool(self.bili_config.get("apex_host_fallback"))
+        )
+        tags_url, tags_route_headers = _apex_routed_url(
+            BILI_TAGS_API, bool(self.bili_config.get("apex_host_fallback"))
+        )
+        tags_payload: dict[str, Any] = {}
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30), headers=headers
             ) as session:
                 async with session.get(
-                    BILI_VIEW_API, params={"bvid": bvid}
+                    request_url, params={"bvid": bvid}, headers=route_headers
                 ) as response:
                     response.raise_for_status()
                     payload = await response.json(content_type=None)
+                try:
+                    async with session.get(
+                        tags_url,
+                        params={"bvid": bvid},
+                        headers=tags_route_headers,
+                    ) as response:
+                        response.raise_for_status()
+                        tags_payload = await response.json(content_type=None)
+                except Exception as exc:
+                    logger.debug("[jrsq] 获取 %s 标签失败: %s", bvid, exc)
         except Exception as exc:
             raise MediaError(f"B站视频详情获取失败: {exc}") from exc
         if payload.get("code") != 0:
@@ -377,11 +465,166 @@ class BiliMediaService:
                 "author": (detail.get("owner") or {}).get("name")
                 or track.get("author"),
                 "duration": int(detail.get("duration") or track.get("duration") or 0),
+                "description": detail.get("desc") or "",
+                "copyright": int(detail.get("copyright") or 0),
+                "category": detail.get("tname") or "",
+                "tags": [
+                    item.get("tag_name", "")
+                    for item in (tags_payload.get("data") or [])
+                    if item.get("tag_name")
+                ],
             }
         )
         return merged
 
+    def _score_candidate(self, track: dict[str, Any], query: str) -> int:
+        title = str(track.get("title") or "")
+        author = str(track.get("author") or "")
+        tags = " ".join(str(tag) for tag in track.get("tags") or [])
+        description = str(track.get("description") or "")
+        category = str(track.get("category") or "")
+        query_normalized = _normalize_search_text(query)
+        title_normalized = _normalize_search_text(title)
+        metadata_normalized = _normalize_search_text(
+            " ".join((title, author, tags, description, category))
+        )
+
+        negative_markers = (
+            "恐怖",
+            "血腥",
+            "排名",
+            "合集",
+            "手书",
+            "手書",
+            "翻唱",
+            "covered",
+            "cover",
+            "remix",
+            "演奏",
+            "教程",
+            "音游",
+            "谱面",
+            "鬼畜",
+            "整活",
+            "meme",
+            "reaction",
+            "下架",
+            "剪辑",
+            "歌切",
+            "动态鼓谱",
+            "鼓谱",
+            "伴奏",
+            "offvocal",
+            "卡拉ok",
+            "mad",
+            "amv",
+            "宅舞",
+            "试跳",
+            "歌单",
+            "电台",
+        )
+        if any(
+            _normalize_search_text(marker) in metadata_normalized
+            for marker in negative_markers
+        ):
+            return -1000
+
+        score = 0
+        if query_normalized and query_normalized in title_normalized:
+            score += 80
+            if title_normalized.startswith(query_normalized):
+                score += 10
+        elif query_normalized and query_normalized in metadata_normalized:
+            score += 30
+        else:
+            score -= 40
+
+        vocal_synth_markers = (
+            "vocaloid",
+            "术力口",
+            "ボカロ",
+            "初音",
+            "miku",
+            "ミク",
+            "gumi",
+            "镜音",
+            "鏡音",
+            "rin",
+            "len",
+            "巡音",
+            "luka",
+            "重音",
+            "可不",
+            "kafu",
+            "歌愛ユキ",
+            "flower",
+        )
+        if any(
+            _normalize_search_text(marker) in metadata_normalized
+            for marker in vocal_synth_markers
+        ):
+            score += 30
+
+        original_markers = ("official", "本家", "原曲", "原创", "オリジナル", "feat")
+        if any(
+            _normalize_search_text(marker) in metadata_normalized
+            for marker in original_markers
+        ):
+            score += 20
+        if int(track.get("copyright") or 0) == 1:
+            score += 30
+        if "official" in author.lower():
+            score += 20
+        duration = int(track.get("duration") or 0)
+        if 60 <= duration <= 600:
+            score += 5
+        return score
+
+    async def rank_candidates(
+        self, tracks: list[dict[str, Any]], query: str
+    ) -> list[dict[str, Any]]:
+        semaphore = asyncio.Semaphore(4)
+
+        async def enrich_limited(track: dict[str, Any]):
+            async with semaphore:
+                try:
+                    return await self.enrich(track)
+                except Exception as exc:
+                    logger.debug(
+                        "[jrsq] 候选详情获取失败 %s: %s", track.get("bvid"), exc
+                    )
+                    return None
+
+        enriched = await asyncio.gather(
+            *(enrich_limited(track) for track in tracks),
+        )
+        minimum_score = int(self.bili_config.get("search_min_score") or 100)
+        ranked: list[dict[str, Any]] = []
+        for track in enriched:
+            if not track:
+                continue
+            score = self._score_candidate(track, query)
+            track["search_score"] = score
+            logger.debug(
+                "[jrsq] 候选评分 %s %s: %s",
+                track.get("bvid"),
+                track.get("title"),
+                score,
+            )
+            if score >= minimum_score:
+                ranked.append(track)
+        ranked.sort(key=lambda item: int(item.get("search_score") or 0), reverse=True)
+        if not ranked:
+            raise MediaError(f"没有找到高置信度的「{query}」原术曲")
+        return ranked
+
     async def search(self, query: str) -> list[dict[str, Any]]:
+        try:
+            return await self._search_api(query)
+        except MediaError as api_error:
+            logger.info("[jrsq] B站搜索接口不可用，尝试备用搜索: %s", api_error)
+        if self.bili_config.get("apex_host_fallback"):
+            return await self._search_html(query)
         try:
             return await asyncio.to_thread(self._search_sync, query)
         except MediaError as ytdlp_error:
@@ -393,6 +636,75 @@ class BiliMediaService:
                     f"{ytdlp_error}；网页搜索也失败: {html_error}"
                 ) from html_error
 
+    async def _search_api(self, query: str) -> list[dict[str, Any]]:
+        count = max(1, min(20, int(self.bili_config.get("search_count") or 5)))
+        headers = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+        if self.bili_config.get("cookie"):
+            headers["Cookie"] = str(self.bili_config["cookie"])
+        request_url, route_headers = _apex_routed_url(
+            BILI_SEARCH_API, bool(self.bili_config.get("apex_host_fallback"))
+        )
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30), headers=headers
+            ) as session:
+                async with session.get(
+                    request_url,
+                    params={
+                        "search_type": "video",
+                        "keyword": query,
+                        "page": 1,
+                        "page_size": count,
+                    },
+                    headers=route_headers,
+                ) as response:
+                    response.raise_for_status()
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            raise MediaError(f"B站搜索接口请求失败: {exc}") from exc
+        if payload.get("code") != 0:
+            raise MediaError(f"B站搜索接口返回 {payload.get('code')}")
+
+        tracks: list[dict[str, Any]] = []
+        for item in (payload.get("data") or {}).get("result") or []:
+            bvid = str(item.get("bvid") or "")
+            if not _extract_bvid(bvid):
+                continue
+            duration_parts = str(item.get("duration") or "0").split(":")
+            try:
+                duration = sum(
+                    int(part) * (60**index)
+                    for index, part in enumerate(reversed(duration_parts))
+                )
+            except ValueError:
+                duration = 0
+            tracks.append(
+                {
+                    "source": "bilibili",
+                    "bvid": bvid,
+                    "url": f"{BILI_VIDEO_BASE}{bvid}",
+                    "title": html.unescape(
+                        re.sub(r"<[^>]+>", "", str(item.get("title") or bvid))
+                    ),
+                    "author": str(item.get("author") or "未知"),
+                    "duration": duration,
+                    "description": html.unescape(
+                        re.sub(r"<[^>]+>", "", str(item.get("description") or ""))
+                    ),
+                    "category": str(item.get("typename") or ""),
+                    "tags": [
+                        tag.strip()
+                        for tag in str(item.get("tag") or "").split(",")
+                        if tag.strip()
+                    ],
+                }
+            )
+            if len(tracks) >= count:
+                break
+        if not tracks:
+            raise MediaError(f"B站搜索接口没有找到「{query}」")
+        return tracks
+
     async def _search_html(self, query: str) -> list[dict[str, Any]]:
         """B站 JSON 搜索被 412 风控时，从服务端渲染的搜索页提取结果。"""
         count = max(1, min(20, int(self.bili_config.get("search_count") or 5)))
@@ -401,13 +713,18 @@ class BiliMediaService:
         headers = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
         if self.bili_config.get("cookie"):
             headers["Cookie"] = str(self.bili_config["cookie"])
+        request_url, route_headers = _apex_routed_url(
+            BILI_SEARCH_PAGE, bool(self.bili_config.get("apex_host_fallback"))
+        )
         timeout = aiohttp.ClientTimeout(total=30)
         try:
             async with aiohttp.ClientSession(
                 timeout=timeout, headers=headers
             ) as session:
                 async with session.get(
-                    BILI_SEARCH_PAGE, params={"keyword": search_query}
+                    request_url,
+                    params={"keyword": search_query},
+                    headers=route_headers,
                 ) as response:
                     response.raise_for_status()
                     body = await response.text()
@@ -519,6 +836,79 @@ class BiliMediaService:
             else None
         )
 
+    async def _write_video_response(
+        self,
+        response: aiohttp.ClientResponse,
+        temp: Path,
+        max_bytes: int,
+    ) -> None:
+        response.raise_for_status()
+        written = 0
+        with temp.open("wb") as file:
+            async for chunk in response.content.iter_chunked(512 * 1024):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise MediaError(
+                        f"视频超过 {self.media_config.get('max_file_size_mb', 100)}MB 限制"
+                    )
+                file.write(chunk)
+
+    async def _download_cdn_via_apex_sni(
+        self,
+        source_urls: list[str],
+        temp: Path,
+        max_bytes: int,
+        base_headers: dict[str, str],
+    ) -> None:
+        """Route blocked CDN SNI through the apex host while preserving CDN routing."""
+        failures: list[str] = []
+        for source_url in source_urls:
+            parts = urlsplit(source_url)
+            cdn_host = parts.hostname or ""
+            if not cdn_host:
+                continue
+            try:
+                address_info = await asyncio.to_thread(
+                    socket.getaddrinfo,
+                    cdn_host,
+                    443,
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                )
+            except OSError as exc:
+                failures.append(f"{cdn_host} DNS: {exc}")
+                continue
+
+            ip_addresses = list(dict.fromkeys(item[4][0] for item in address_info))
+            routed_url = urlunsplit(
+                (parts.scheme, "bilibili.com", parts.path, parts.query, parts.fragment)
+            )
+            for ip_address in ip_addresses[:6]:
+                ssl_context = ssl.create_default_context()
+                # The CA chain remains verified. Hostname checking is intentionally
+                # disabled because TLS uses the apex SNI while HTTP routes by CDN Host.
+                ssl_context.check_hostname = False
+                connector = aiohttp.TCPConnector(
+                    resolver=_FixedResolver(ip_address),
+                    use_dns_cache=False,
+                    ssl=ssl_context,
+                )
+                request_headers = {**base_headers, "Host": cdn_host}
+                try:
+                    async with aiohttp.ClientSession(
+                        connector=connector,
+                        timeout=aiohttp.ClientTimeout(total=180),
+                        headers=request_headers,
+                    ) as session:
+                        async with session.get(routed_url) as response:
+                            await self._write_video_response(response, temp, max_bytes)
+                    return
+                except Exception as exc:
+                    temp.unlink(missing_ok=True)
+                    failures.append(f"{cdn_host}@{ip_address}: {exc}")
+        detail = "；".join(failures[-3:]) or "没有可用 CDN 地址"
+        raise MediaError(f"B站 CDN SNI 兼容下载失败: {detail}")
+
     async def _download_progressive(
         self, track: dict[str, Any]
     ) -> tuple[Path, dict[str, Any]]:
@@ -537,6 +927,9 @@ class BiliMediaService:
         quality = 64 if height >= 720 else 32 if height >= 480 else 16
         output = CACHE_DIR / f"{_safe_filename(bvid)}.mp4"
         temp = output.with_suffix(".mp4.part")
+        apex_fallback = bool(self.bili_config.get("apex_host_fallback"))
+        view_url, view_route_headers = _apex_routed_url(BILI_VIEW_API, apex_fallback)
+        play_url, play_route_headers = _apex_routed_url(BILI_PLAYURL_API, apex_fallback)
         try:
             async with aiohttp.ClientSession(
                 timeout=timeout, headers=headers
@@ -545,7 +938,9 @@ class BiliMediaService:
                 cid = int(track.get("cid") or 0)
                 if not cid:
                     async with session.get(
-                        BILI_VIEW_API, params={"bvid": bvid}
+                        view_url,
+                        params={"bvid": bvid},
+                        headers=view_route_headers,
                     ) as response:
                         response.raise_for_status()
                         view = await response.json(content_type=None)
@@ -561,28 +956,66 @@ class BiliMediaService:
                     "platform": "html5",
                     "high_quality": 1,
                 }
-                async with session.get(BILI_PLAYURL_API, params=params) as response:
-                    response.raise_for_status()
-                    play = await response.json(content_type=None)
-                urls = (play.get("data") or {}).get("durl") or []
-                if play.get("code") != 0 or not urls or not urls[0].get("url"):
-                    raise MediaError(f"B站单文件播放接口返回 {play.get('code')}")
-                declared = int(urls[0].get("size") or 0)
+                source_urls: list[str] = []
+                declared = 0
+                play_code: int | None = None
+                play_attempts = 8 if apex_fallback else 1
+                for attempt in range(play_attempts):
+                    request_params = {
+                        **params,
+                        "ts": int(time.time() * 1000) + attempt,
+                    }
+                    request_headers = {
+                        **play_route_headers,
+                        "Cache-Control": "no-cache",
+                    }
+                    async with session.get(
+                        play_url,
+                        params=request_params,
+                        headers=request_headers,
+                    ) as response:
+                        response.raise_for_status()
+                        play = await response.json(content_type=None)
+                    play_code = play.get("code")
+                    durl = (play.get("data") or {}).get("durl") or []
+                    if durl and durl[0].get("url"):
+                        declared = max(declared, int(durl[0].get("size") or 0))
+                        candidates = [
+                            durl[0]["url"],
+                            *(durl[0].get("backup_url") or []),
+                        ]
+                        source_urls.extend(
+                            url for url in candidates if url not in source_urls
+                        )
+                        if any("upos-sz-estgoss" in url for url in source_urls):
+                            break
+                    if attempt + 1 < play_attempts:
+                        await asyncio.sleep(0.15)
+                if not source_urls:
+                    raise MediaError(f"B站单文件播放接口返回 {play_code}")
                 if declared and declared > max_bytes:
                     raise MediaError(
                         f"视频约 {declared / 1024 / 1024:.1f}MB，超过配置限制"
                     )
-                async with session.get(urls[0]["url"]) as response:
-                    response.raise_for_status()
-                    written = 0
-                    with temp.open("wb") as file:
-                        async for chunk in response.content.iter_chunked(512 * 1024):
-                            written += len(chunk)
-                            if written > max_bytes:
-                                raise MediaError(
-                                    f"视频超过 {self.media_config.get('max_file_size_mb', 100)}MB 限制"
+                if apex_fallback:
+                    await self._download_cdn_via_apex_sni(
+                        source_urls, temp, max_bytes, headers
+                    )
+                else:
+                    last_error: Exception | None = None
+                    for source_url in source_urls:
+                        try:
+                            async with session.get(source_url) as response:
+                                await self._write_video_response(
+                                    response, temp, max_bytes
                                 )
-                            file.write(chunk)
+                            last_error = None
+                            break
+                        except Exception as exc:
+                            temp.unlink(missing_ok=True)
+                            last_error = exc
+                    if last_error:
+                        raise last_error
             if temp.stat().st_size <= 1024:
                 raise MediaError("B站返回的视频文件为空")
             os.replace(temp, output)
@@ -789,7 +1222,7 @@ class NeteaseService:
         return output
 
 
-@register("jrsq", "sakura", "每日术曲：B站视频搜索、完整视频发送与定时推送", "4.1.0")
+@register("jrsq", "sakura", "每日术曲：B站视频搜索、完整视频发送与定时推送", "4.2.0")
 class JRSQPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -860,11 +1293,12 @@ class JRSQPlugin(Star):
         self, track: dict[str, Any], prefix: str = "🎵 术曲推荐"
     ) -> list:
         async with self.media_lock:
-            path, detail = await self.bili_media.download(track)
-        return [
-            Plain(self._bili_text(detail, prefix)),
-            Video.fromFileSystem(path=str(path)),
-        ]
+            path, _detail = await self.bili_media.download(track)
+        resolved = path.resolve()
+        # AstrBot 4.19 may build a backslash-based Windows file URI here,
+        # which can leave NapCat waiting until the WebSocket API times out.
+        # pathlib emits a standard file:///C:/... URI; send the video alone.
+        return [Video(file=resolved.as_uri(), path=str(resolved))]
 
     async def _netease_chain(self, track: dict[str, Any]) -> list:
         if not self.netease:
@@ -891,7 +1325,6 @@ class JRSQPlugin(Star):
         query: str,
         source: str | None = None,
         prefix: str = "🔎 找到术曲",
-        random_choice: bool = False,
     ) -> tuple[list, str]:
         aliases = {
             "bili": "bilibili",
@@ -913,12 +1346,10 @@ class JRSQPlugin(Star):
             try:
                 if current == "bilibili" and self.bili_config.get("enabled", True):
                     tracks = await self.bili_media.search(query)
-                    if random_choice:
-                        random.shuffle(tracks)
+                    tracks = await self.bili_media.rank_candidates(tracks, query)
                     candidate_errors: list[str] = []
-                    for item in tracks:
+                    for track in tracks:
                         try:
-                            track = await self.bili_media.enrich(item)
                             if not self._duration_allowed(track):
                                 candidate_errors.append(
                                     f"{track['title']} 超过时长限制"
@@ -951,6 +1382,20 @@ class JRSQPlugin(Star):
                 errors.append(f"{current}: {message}")
                 logger.warning("[shuqu] %s 获取「%s」失败: %s", current, query, exc)
         raise MediaError("；".join(errors) or "没有启用可用的音乐来源")
+
+    def _pick_daily_query(self) -> str:
+        queries = [
+            str(query).strip()
+            for query in (self.push_config.get("daily_queries") or [])
+            if str(query).strip()
+        ]
+        if queries:
+            return random.choice(queries)
+        return str(
+            self.push_config.get("fallback_search_query")
+            or self.bili_config.get("default_query")
+            or "千本樱"
+        )
 
     @filter.command("jrsq", alias={"shuqu"})
     async def command_jrsq(self, event: AstrMessageEvent):
@@ -1032,13 +1477,11 @@ class JRSQPlugin(Star):
         try:
             song = await self.db.random()
             if not song:
-                query = str(self.bili_config.get("default_query") or "术曲")
+                query = self._pick_daily_query()
                 yield event.plain_result(
                     f"🔍 曲库为空，正在从B站搜索「{query}」并下载视频..."
                 )
-                chain, _ = await self._search_and_build(
-                    query, "bilibili", random_choice=True
-                )
+                chain, _ = await self._search_and_build(query, "bilibili")
                 yield event.chain_result(chain)
                 return
             yield event.plain_result(f"🎲 抽到「{song['title']}」，正在准备视频...")
@@ -1232,16 +1675,11 @@ class JRSQPlugin(Star):
                     "🌞 每日术曲推荐",
                 )
             else:
-                query = str(
-                    self.push_config.get("fallback_search_query")
-                    or self.bili_config.get("default_query")
-                    or "术曲"
-                )
+                query = self._pick_daily_query()
                 components, _ = await self._search_and_build(
                     query,
                     "bilibili",
                     "🌞 每日术曲推荐",
-                    random_choice=True,
                 )
         except Exception as exc:
             logger.error(
