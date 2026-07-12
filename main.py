@@ -413,9 +413,28 @@ class BiliMediaService:
                 options["cookiefile"] = str(cookie_path)
         if self.media_config.get("proxy"):
             options["proxy"] = self.media_config["proxy"]
-        if self.media_config.get("ffmpeg_location"):
-            options["ffmpeg_location"] = self.media_config["ffmpeg_location"]
+        ffmpeg_location = self._resolve_ffmpeg_location()
+        if ffmpeg_location:
+            options["ffmpeg_location"] = ffmpeg_location
         return options
+
+    def _resolve_ffmpeg_location(self) -> str | None:
+        """Find configured, system, or bundled ffmpeg for yt-dlp merging."""
+        configured = str(self.media_config.get("ffmpeg_location") or "").strip()
+        if configured:
+            return configured
+        system_ffmpeg = shutil.which("ffmpeg")
+        if system_ffmpeg:
+            return system_ffmpeg
+        try:
+            import imageio_ffmpeg
+
+            bundled = imageio_ffmpeg.get_ffmpeg_exe()
+            if bundled and Path(bundled).is_file():
+                return bundled
+        except Exception as exc:
+            logger.debug("[jrsq] 未找到内置 ffmpeg: %s", exc)
+        return None
 
     async def enrich(self, track: dict[str, Any]) -> dict[str, Any]:
         """用视频详情补齐网页搜索结果的 UP 主、时长和 cid。"""
@@ -909,6 +928,29 @@ class BiliMediaService:
         detail = "；".join(failures[-3:]) or "没有可用 CDN 地址"
         raise MediaError(f"B站 CDN SNI 兼容下载失败: {detail}")
 
+    async def _download_cdn_direct(
+        self,
+        source_urls: list[str],
+        temp: Path,
+        max_bytes: int,
+        base_headers: dict[str, str],
+    ) -> None:
+        """Try each original CDN URL before applying the apex-SNI workaround."""
+        failures: list[str] = []
+        timeout = aiohttp.ClientTimeout(total=180, connect=15, sock_connect=15)
+        async with aiohttp.ClientSession(timeout=timeout, headers=base_headers) as session:
+            for source_url in source_urls:
+                cdn_host = urlsplit(source_url).hostname or "未知 CDN"
+                try:
+                    async with session.get(source_url) as response:
+                        await self._write_video_response(response, temp, max_bytes)
+                    return
+                except Exception as exc:
+                    temp.unlink(missing_ok=True)
+                    failures.append(f"{cdn_host}: {exc}")
+        detail = "；".join(failures[-3:]) or "没有可用 CDN 地址"
+        raise MediaError(f"B站 CDN 直连下载失败: {detail}")
+
     async def _download_progressive(
         self, track: dict[str, Any]
     ) -> tuple[Path, dict[str, Any]]:
@@ -997,25 +1039,20 @@ class BiliMediaService:
                     raise MediaError(
                         f"视频约 {declared / 1024 / 1024:.1f}MB，超过配置限制"
                     )
-                if apex_fallback:
+                try:
+                    await self._download_cdn_direct(
+                        source_urls, temp, max_bytes, headers
+                    )
+                except MediaError as direct_error:
+                    if not apex_fallback:
+                        raise
+                    logger.info(
+                        "[jrsq] B站 CDN 直连失败，尝试顶级域名 SNI 兼容: %s",
+                        direct_error,
+                    )
                     await self._download_cdn_via_apex_sni(
                         source_urls, temp, max_bytes, headers
                     )
-                else:
-                    last_error: Exception | None = None
-                    for source_url in source_urls:
-                        try:
-                            async with session.get(source_url) as response:
-                                await self._write_video_response(
-                                    response, temp, max_bytes
-                                )
-                            last_error = None
-                            break
-                        except Exception as exc:
-                            temp.unlink(missing_ok=True)
-                            last_error = exc
-                    if last_error:
-                        raise last_error
             if temp.stat().st_size <= 1024:
                 raise MediaError("B站返回的视频文件为空")
             os.replace(temp, output)
@@ -1053,6 +1090,9 @@ class BiliMediaService:
             {
                 "outtmpl": str(CACHE_DIR / f"{media_id}.%(ext)s"),
                 "format": (
+                    f"bestvideo[vcodec^=avc1][ext=mp4][height<=?{height}]"
+                    "+bestaudio[acodec^=mp4a]/"
+                    f"bestvideo[vcodec^=avc1][height<=?{height}]+bestaudio/"
                     f"bestvideo[ext=mp4][height<=?{height}]+bestaudio[ext=m4a]/"
                     f"bestvideo[height<=?{height}]+bestaudio/"
                     f"best[height<=?{height}]"
@@ -1222,7 +1262,7 @@ class NeteaseService:
         return output
 
 
-@register("jrsq", "sakura", "每日术曲：B站视频搜索、完整视频发送与定时推送", "4.2.0")
+@register("jrsq", "sakura", "每日术曲：B站视频搜索、完整视频发送与定时推送", "4.2.1")
 class JRSQPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)

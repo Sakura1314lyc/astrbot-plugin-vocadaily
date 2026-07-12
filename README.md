@@ -57,7 +57,7 @@ pip install -r requirements.txt
 
 重启 AstrBot 或在 WebUI 中重载插件。
 
-插件要求 AstrBot `4.19.2+`，B站搜索与下载依赖 `yt-dlp`。建议安装 `ffmpeg`，用于合并 B站提供的 DASH 音视频流；没有 ffmpeg 时，插件会优先请求游客可用的带声音单文件 MP4。
+插件要求 AstrBot `4.19.2+`，B站搜索与下载依赖 `yt-dlp`。依赖安装会同时提供内置 ffmpeg，用于合并 B站 DASH 音视频流；也可通过 `media.ffmpeg_location` 指定系统 ffmpeg。
 
 ## 基础配置
 
@@ -133,7 +133,7 @@ https://space.bilibili.com/用户ID/favlist?fid=收藏夹ID
 | `max_duration_seconds` | 最大视频时长；`0` 表示不限 |
 | `max_file_size_mb` | 最大下载和发送大小 |
 | `cache_hours` | 视频缓存保留时间 |
-| `ffmpeg_location` | ffmpeg 可执行文件或目录；已加入 PATH 时留空 |
+| `ffmpeg_location` | 可选的 ffmpeg 可执行文件或目录；留空时自动使用系统或插件依赖提供的 ffmpeg |
 | `proxy` | yt-dlp 代理，例如 `http://127.0.0.1:7890` |
 
 视频缓存在 `data/media_cache/`，过期文件会在插件启动时清理。
