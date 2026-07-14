@@ -28,6 +28,10 @@
     "ffmpeg_location": "",
     "proxy": ""
   },
+  "review": {
+    "enabled": true,
+    "max_chars": 100
+  },
   "push": {
     "enabled": true,
     "cron_hour": 12,
