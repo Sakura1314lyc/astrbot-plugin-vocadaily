@@ -246,6 +246,34 @@ class SearchLogicTests(unittest.TestCase):
         )
         self.assertIn("カバー", assessment.rejected_reason or "")
 
+    def test_cover_tag_is_rejected_even_when_title_is_ambiguous(self):
+        assessment = assess_candidate(
+            {
+                "title": "【える】Unknown Mother-Goose",
+                "tags": ["える", "翻唱", "授权转载"],
+                "duration": 269,
+            },
+            "Unknown Mother",
+        )
+        self.assertIn("标签", assessment.rejected_reason or "")
+
+    def test_cover_cannot_borrow_original_signal_from_description(self):
+        assessment = assess_candidate(
+            {
+                "title": "【urei】Unknown Mother Goose",
+                "author": "精神安定剤",
+                "tags": ["urei", "アンノウン・マザーグース"],
+                "description": (
+                    "original: wowaka / Vocal: Hatsune Miku / Vocal: urei"
+                ),
+                "duration": 355,
+                "copyright": 2,
+            },
+            "Unknown Mother",
+        )
+        self.assertFalse(assessment.song_signal)
+        self.assertLess(assessment.score, 90)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -369,6 +369,15 @@ def assess_candidate(
             False,
             f"标题含排除词：{hard_negatives[0]}",
         )
+    tagged_negatives = _find_markers(f"{tags} {category}", HARD_NEGATIVE_MARKERS)
+    if tagged_negatives:
+        return CandidateAssessment(
+            -1000,
+            "rejected",
+            query_norm in title_norm,
+            False,
+            f"标签含排除词：{tagged_negatives[0]}",
+        )
 
     if title_norm == query_norm:
         score, match_quality = 160, "exact"
@@ -383,10 +392,11 @@ def assess_candidate(
     else:
         score, match_quality = -70, "none"
 
+    signal_context = f"{title} {author} {tags} {category}"
     vocal_title = bool(_find_markers(f"{title} {tags}", VOCAL_SYNTH_MARKERS))
-    vocal_metadata = bool(_find_markers(metadata, VOCAL_SYNTH_MARKERS))
+    vocal_metadata = bool(_find_markers(signal_context, VOCAL_SYNTH_MARKERS))
     original_title = bool(_find_markers(title, ORIGINAL_MARKERS))
-    original_metadata = bool(_find_markers(metadata, ORIGINAL_MARKERS))
+    original_metadata = bool(_find_markers(signal_context, ORIGINAL_MARKERS))
     official_author = _marker_present(author, "official") or "官方" in author
     song_signal = vocal_metadata or original_metadata or official_author
 
