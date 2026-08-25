@@ -5,7 +5,7 @@
 # 今日术曲
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.19.2%2B-blue.svg)](https://github.com/AstrBotDevs/AstrBot)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 一个给 AstrBot 群聊用的术曲推荐插件。
@@ -61,7 +61,7 @@ git clone https://github.com/Sakura1314lyc/astrbot-plugin-vocadaily.git
 ## 运行要求
 
 - AstrBot `4.19.2+`
-- Python `3.10+`
+- Python `3.12+`
 - 能正常访问 B站的网络环境
 - 使用 URL 投递时，协议端能访问配置的媒体服务地址
 
