@@ -3,11 +3,13 @@
     "enabled": true,
     "media_id": "8745208",
     "page_size": 20,
-    "search_count": 10,
+    "search_count": 20,
+    "detail_count": 10,
+    "search_cache_minutes": 10,
     "search_suffix": "VOCALOID 原曲 MV",
     "default_query": "术曲",
     "apex_host_fallback": true,
-    "search_min_score": 100,
+    "search_min_score": 90,
     "cookie": "",
     "cookies_file": ""
   },
@@ -26,7 +28,11 @@
     "max_file_size_mb": 100,
     "cache_hours": 24,
     "ffmpeg_location": "",
-    "proxy": ""
+    "proxy": "",
+    "delivery_mode": "filesystem",
+    "serve_host": "0.0.0.0",
+    "serve_port": 6200,
+    "public_base_url": ""
   },
   "review": {
     "enabled": true,
