@@ -5,8 +5,10 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from difflib import SequenceMatcher
+from typing import Any
 
 _CHAR_TRANSLATION = str.maketrans(
     {
@@ -23,7 +25,17 @@ HARD_NEGATIVE_MARKERS = (
     "翻弹",
     "covered",
     "cover",
+    "カバー",
+    "歌ってみた",
+    "踊ってみた",
+    "弾いてみた",
+    "アレンジ",
+    "リミックス",
     "remix",
+    "duet",
+    "合唱",
+    "对唱",
+    "對唱",
     "演奏",
     "教程",
     "学唱",
@@ -49,6 +61,9 @@ HARD_NEGATIVE_MARKERS = (
     "amv",
     "mmd",
     "宅舞",
+    "手书",
+    "手書き",
+    "描改",
     "试跳",
     "試跳",
     "直拍",
@@ -121,6 +136,20 @@ SOFT_NEGATIVE_MARKERS = (
     "自用",
     "完整版",
     "但是",
+    "中文字幕",
+    "字幕版",
+    "音质提升",
+    "音質提升",
+    "高音质",
+    "高音質",
+    "无损",
+    "無損",
+    "4k",
+    "60fps",
+    "120fps",
+    "v4x",
+    "svp",
+    "vsqx",
 )
 
 VOCAL_SYNTH_MARKERS = (
@@ -207,6 +236,103 @@ def _find_markers(text: str, markers: Iterable[str]) -> tuple[str, ...]:
     return tuple(marker for marker in markers if _marker_present(text, marker))
 
 
+_BRACKETED_PREFIX_RE = re.compile(
+    r"(?:【[^】]{0,80}】|\[[^\]]{0,80}\]|\([^)]{0,80}\)|（[^）]{0,80}）)"
+)
+_QUOTED_TITLE_RE = re.compile(r"[《「『](?P<title>[^》」』]{2,80})[》」』]")
+_TITLE_SEPARATOR_RE = re.compile(r"\s*(?:/|／|\||｜|—|–)\s*")
+
+
+def _title_match_variants(title: str) -> tuple[str, ...]:
+    """Return compact title-shaped strings for fuzzy comparison."""
+
+    raw = unicodedata.normalize("NFKC", str(title or ""))
+    values = [raw]
+    values.extend(match.group("title") for match in _QUOTED_TITLE_RE.finditer(raw))
+    stripped = _BRACKETED_PREFIX_RE.sub(" ", raw).strip()
+    if stripped:
+        values.append(stripped)
+        values.extend(_TITLE_SEPARATOR_RE.split(stripped))
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = normalize_search_text(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return tuple(result)
+
+
+def _best_title_similarity(title: str, query: str) -> float:
+    query_norm = normalize_search_text(query)
+    if len(query_norm) < 4:
+        return 0.0
+    return max(
+        (
+            SequenceMatcher(None, query_norm, variant, autojunk=False).ratio()
+            for variant in _title_match_variants(title)
+        ),
+        default=0.0,
+    )
+
+
+def derive_query_variants(
+    tracks: Iterable[dict[str, Any]], query: str, *, limit: int = 3
+) -> list[str]:
+    """Derive likely canonical titles from strong top search results.
+
+    Bilibili often understands a remembered or translated song name even when
+    the returned title uses a different language. These variants are only used
+    for a second search pass; they are never presented as authoritative data.
+    """
+
+    query_norm = normalize_search_text(query)
+    singer_names = {
+        normalize_search_text(marker)
+        for marker in VOCAL_SYNTH_MARKERS
+        if normalize_search_text(marker)
+    }
+    variants: list[str] = []
+    seen = {query_norm}
+
+    for position, track in enumerate(tracks):
+        if position >= 4 or len(variants) >= limit:
+            break
+        title = unicodedata.normalize("NFKC", str(track.get("title") or ""))
+        metadata = f"{title} {' '.join(str(tag) for tag in track.get('tags') or [])}"
+        if not (
+            _find_markers(metadata, VOCAL_SYNTH_MARKERS)
+            or _find_markers(metadata, ORIGINAL_MARKERS)
+        ):
+            continue
+
+        quoted = [
+            match.group("title").strip()
+            for match in _QUOTED_TITLE_RE.finditer(title)
+        ]
+        stripped = _BRACKETED_PREFIX_RE.sub(" ", title).strip()
+        pieces = [*quoted]
+        if stripped:
+            pieces.extend(_TITLE_SEPARATOR_RE.split(stripped))
+            pieces.append(stripped)
+
+        for piece in pieces:
+            piece = piece.strip(" \t\r\n-—–:：,，!！?？'\"")
+            normalized = normalize_search_text(piece)
+            if not 3 <= len(normalized) <= 64:
+                continue
+            if normalized in seen or normalized in singer_names:
+                continue
+            if _find_markers(piece, HARD_NEGATIVE_MARKERS):
+                continue
+            seen.add(normalized)
+            variants.append(piece)
+            if len(variants) >= limit:
+                break
+    return variants
+
+
 @dataclass(frozen=True)
 class CandidateAssessment:
     score: int
@@ -228,7 +354,7 @@ def assess_candidate(
     category = str(track.get("category") or "")
     title_norm = normalize_search_text(title)
     query_norm = normalize_search_text(query)
-    metadata = " ".join((title, author, tags, description, category))
+    metadata = f"{title} {author} {tags} {description} {category}"
     metadata_norm = normalize_search_text(metadata)
 
     if not query_norm:
@@ -250,12 +376,14 @@ def assess_candidate(
         score, match_quality = 130, "prefix"
     elif query_norm in title_norm:
         score, match_quality = 105, "title"
+    elif _best_title_similarity(title, query) >= 0.60:
+        score, match_quality = 92, "fuzzy"
     elif query_norm in metadata_norm:
         score, match_quality = 35, "metadata"
     else:
         score, match_quality = -70, "none"
 
-    vocal_title = bool(_find_markers(" ".join((title, tags)), VOCAL_SYNTH_MARKERS))
+    vocal_title = bool(_find_markers(f"{title} {tags}", VOCAL_SYNTH_MARKERS))
     vocal_metadata = bool(_find_markers(metadata, VOCAL_SYNTH_MARKERS))
     original_title = bool(_find_markers(title, ORIGINAL_MARKERS))
     original_metadata = bool(_find_markers(metadata, ORIGINAL_MARKERS))
@@ -267,11 +395,11 @@ def assess_candidate(
     elif vocal_metadata:
         score += 18
     if original_title:
-        score += 24
+        score += 40
     elif original_metadata:
         score += 12
     if official_author:
-        score += 28
+        score += 16
     if _safe_int(track.get("copyright")) == 1:
         score += 10
     if not song_signal:
@@ -283,7 +411,7 @@ def assess_candidate(
 
     soft_title = _find_markers(title, SOFT_NEGATIVE_MARKERS)
     score -= min(60, 24 * len(soft_title))
-    if _find_markers(" ".join((description, tags)), HARD_NEGATIVE_MARKERS):
+    if _find_markers(f"{description} {tags}", HARD_NEGATIVE_MARKERS):
         score -= 8
 
     duration = parse_duration(track.get("duration"))
@@ -305,7 +433,7 @@ def assess_candidate(
     return CandidateAssessment(
         score=score,
         match_quality=match_quality,
-        title_match=match_quality in {"exact", "prefix", "title"},
+        title_match=match_quality in {"exact", "prefix", "title", "fuzzy"},
         song_signal=song_signal,
     )
 

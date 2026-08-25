@@ -14,7 +14,7 @@ import socket
 import ssl
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
@@ -23,11 +23,12 @@ from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import File, Plain, Record, Video
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
 try:
     from .search_logic import (
         assess_candidate,
+        derive_query_variants,
         normalize_search_text,
         parse_duration,
         rank_search_candidates,
@@ -35,6 +36,7 @@ try:
 except ImportError:  # 允许在仓库根目录直接运行测试和诊断脚本
     from search_logic import (
         assess_candidate,
+        derive_query_variants,
         normalize_search_text,
         parse_duration,
         rank_search_candidates,
@@ -60,6 +62,7 @@ BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl"
 BILI_TAGS_API = "https://api.bilibili.com/x/tag/archive/tags"
 BILI_SEARCH_API = "https://api.bilibili.com/x/web-interface/search/type"
 BILI_SEARCH_PAGE = "https://search.bilibili.com/all"
+BILI_HOME = "https://www.bilibili.com/"
 BILI_VIDEO_BASE = "https://www.bilibili.com/video/"
 NETEASE_SEARCH_API = "https://music.163.com/api/search/get"
 NETEASE_SONG_BASE = "https://music.163.com/#/song?id="
@@ -228,9 +231,22 @@ def load_plugin_config() -> dict[str, Any]:
         with CONFIG_PATH.open("r", encoding="utf-8") as file:
             raw = json.load(file)
         if not isinstance(raw, dict):
-            raise ValueError("配置根节点必须是 JSON 对象")
-        return _deep_merge(DEFAULT_CONFIG, raw)
-    except Exception as exc:
+            raise TypeError("配置根节点必须是 JSON 对象")
+        merged = _deep_merge(DEFAULT_CONFIG, raw)
+        for section, defaults in DEFAULT_CONFIG.items():
+            if isinstance(defaults, dict) and not isinstance(merged.get(section), dict):
+                logger.warning("[jrsq] 配置段 %s 不是对象，已恢复默认值", section)
+                merged[section] = _deep_merge(defaults, {})
+        for section, key in (
+            ("media", "source_order"),
+            ("push", "daily_queries"),
+            ("push", "target_umos"),
+        ):
+            if not isinstance(merged[section].get(key), list):
+                logger.warning("[jrsq] 配置项 %s.%s 不是列表，已恢复默认值", section, key)
+                merged[section][key] = list(DEFAULT_CONFIG[section][key])
+        return merged
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
         logger.error("[shuqu] 读取配置失败，使用默认配置: %s", exc)
         return _deep_merge(DEFAULT_CONFIG, {})
 
@@ -248,14 +264,14 @@ def _safe_filename(value: str, fallback: str = "media") -> str:
     return value[:80] or fallback
 
 
-def _format_duration(seconds: int | float | None) -> str:
+def _format_duration(seconds: float | None) -> str:
     seconds = max(0, int(seconds or 0))
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def _extract_bvid(value: str) -> str | None:
     match = re.search(r"BV[0-9A-Za-z]{10}", value, re.IGNORECASE)
-    return match.group(0) if match else None
+    return f"BV{match.group(0)[2:]}" if match else None
 
 
 def _error_text(exc: BaseException) -> str:
@@ -447,7 +463,7 @@ class BiliAPI:
 class BiliMediaService:
     """通过 yt-dlp 搜索 B站并下载适合群聊发送的单文件视频。"""
 
-    VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm"}
+    VIDEO_SUFFIXES: ClassVar[set[str]] = {".mp4", ".mkv", ".mov", ".webm"}
 
     def __init__(self, bili_config: dict[str, Any], media_config: dict[str, Any]):
         self.bili_config = bili_config
@@ -496,7 +512,7 @@ class BiliMediaService:
             bundled = imageio_ffmpeg.get_ffmpeg_exe()
             if bundled and Path(bundled).is_file():
                 return bundled
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - optional third-party discovery
             logger.debug("[jrsq] 未找到内置 ffmpeg: %s", exc)
         return None
 
@@ -530,7 +546,7 @@ class BiliMediaService:
                             self.bili_config.get("apex_host_fallback")
                         ),
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - tags are best-effort
                     logger.debug("[jrsq] 获取 %s 标签失败: %s", bvid, exc)
         except Exception as exc:
             raise MediaError(f"B站视频详情获取失败: {exc}") from exc
@@ -577,17 +593,30 @@ class BiliMediaService:
             async with semaphore:
                 try:
                     return await self.enrich(track)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - candidate details are optional
                     logger.debug(
                         "[jrsq] 候选详情获取失败 %s: %s", track.get("bvid"), exc
                     )
                     return track
 
-        enriched = await asyncio.gather(
-            *(enrich_limited(track) for track in tracks[:detail_count]),
+        # A broadened search appends a second batch, so simply enriching the
+        # first N items can starve its best result of details.  Prioritize the
+        # strongest raw title matches across all batches, then restore the
+        # original order so Bilibili's search position remains a tie-breaker.
+        detail_indexes = sorted(
+            range(len(tracks)),
+            key=lambda index: (
+                assess_candidate(tracks[index], query, position=index).score,
+                -index,
+            ),
+            reverse=True,
+        )[:detail_count]
+        detail_results = await asyncio.gather(
+            *(enrich_limited(tracks[index]) for index in detail_indexes),
         )
-        if len(tracks) > detail_count:
-            enriched.extend(tracks[detail_count:])
+        enriched = [dict(track) for track in tracks]
+        for index, result in zip(detail_indexes, detail_results, strict=True):
+            enriched[index] = result
         minimum_score = _bounded_int(
             self.bili_config.get("search_min_score"), 90, 0, 300
         )
@@ -607,7 +636,7 @@ class BiliMediaService:
         return ranked
 
     async def find_candidates(self, query: str) -> list[dict[str, Any]]:
-        """Search exact terms first, then broaden only when ranking finds nothing."""
+        """Search exact terms first, then cautiously derive a canonical title."""
 
         query = " ".join(str(query).split()).strip()
         if not query:
@@ -639,6 +668,7 @@ class BiliMediaService:
         collected: list[dict[str, Any]] = []
         seen: set[str] = set()
         errors: list[str] = []
+        fuzzy_fallback: list[dict[str, Any]] = []
         for variant in variants:
             try:
                 tracks = await self.search(variant)
@@ -653,10 +683,43 @@ class BiliMediaService:
                     seen.add(bvid)
                 collected.append(track)
             try:
-                return await self.rank_candidates(collected, query)
+                ranked = await self.rank_candidates(collected, query)
+                if ranked[0].get("search_match") not in {"fuzzy", "metadata"}:
+                    return ranked
+                fuzzy_fallback = ranked
             except MediaError as exc:
                 errors.append(f"{variant}: {_error_text(exc)}")
-        raise MediaError("；".join(errors[-3:]) or f"没有找到「{query}」")
+
+        # A remembered Chinese title can differ from the title used by the
+        # original upload.  Bilibili's own first results often contain the
+        # canonical title in quotes, so use that for one bounded second pass.
+        # This deliberately avoids asking an LLM to invent song aliases.
+        derived_variants = derive_query_variants(collected, query)
+        for derived in derived_variants:
+            logger.info("[jrsq] 根据搜索结果将「%s」扩展为「%s」", query, derived)
+            try:
+                tracks = await self.search(derived)
+            except MediaError as exc:
+                errors.append(f"{derived}: {_error_text(exc)}")
+                continue
+
+            merged: list[dict[str, Any]] = []
+            merged_seen: set[str] = set()
+            for track in [*tracks, *collected]:
+                bvid = str(track.get("bvid") or "")
+                if bvid and bvid in merged_seen:
+                    continue
+                if bvid:
+                    merged_seen.add(bvid)
+                merged.append(track)
+            try:
+                return await self.rank_candidates(merged, derived)
+            except MediaError as exc:
+                errors.append(f"{derived}: {_error_text(exc)}")
+
+        if fuzzy_fallback:
+            return fuzzy_fallback
+        raise MediaError("；".join(errors[-4:]) or f"没有找到「{query}」")
 
     async def search(self, query: str) -> list[dict[str, Any]]:
         cache_key = normalize_search_text(query)
@@ -697,13 +760,27 @@ class BiliMediaService:
 
     async def _search_api(self, query: str) -> list[dict[str, Any]]:
         count = _bounded_int(self.bili_config.get("search_count"), 20, 1, 20)
-        headers = {"User-Agent": UA, "Referer": "https://search.bilibili.com/"}
-        if self.bili_config.get("cookie"):
-            headers["Cookie"] = str(self.bili_config["cookie"])
+        configured_cookie = str(self.bili_config.get("cookie") or "").strip()
+        headers = {
+            "User-Agent": UA,
+            "Referer": BILI_HOME,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+        }
+        if configured_cookie:
+            headers["Cookie"] = configured_cookie
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30), headers=headers
             ) as session:
+                if not configured_cookie:
+                    try:
+                        async with session.get(BILI_HOME) as bootstrap_response:
+                            bootstrap_response.raise_for_status()
+                            await bootstrap_response.read()
+                    except Exception as exc:  # noqa: BLE001 - bootstrap is best-effort
+                        # The search request below remains authoritative.  Some
+                        # networks block the homepage but still allow the API.
+                        logger.debug("[jrsq] B站匿名会话初始化失败: %s", exc)
                 async with session.get(
                     BILI_SEARCH_API,
                     params={
@@ -766,13 +843,12 @@ class BiliMediaService:
         try:
             async with aiohttp.ClientSession(
                 timeout=timeout, headers=headers
-            ) as session:
-                async with session.get(
-                    BILI_SEARCH_PAGE,
-                    params={"keyword": query},
-                ) as response:
-                    response.raise_for_status()
-                    body = await response.text()
+            ) as session, session.get(
+                BILI_SEARCH_PAGE,
+                params={"keyword": query},
+            ) as response:
+                response.raise_for_status()
+                body = await response.text()
         except Exception as exc:
             raise MediaError(f"B站搜索页请求失败: {exc}") from exc
 
@@ -970,11 +1046,10 @@ class BiliMediaService:
                         connector=connector,
                         timeout=aiohttp.ClientTimeout(total=180),
                         headers=request_headers,
-                    ) as session:
-                        async with session.get(routed_url) as response:
-                            await self._write_video_response(response, temp, max_bytes)
+                    ) as session, session.get(routed_url) as response:
+                        await self._write_video_response(response, temp, max_bytes)
                     return
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - try the next CDN address
                     temp.unlink(missing_ok=True)
                     failures.append(f"{cdn_host}@{ip_address}: {exc}")
         detail = "；".join(failures[-3:]) or "没有可用 CDN 地址"
@@ -1000,7 +1075,7 @@ class BiliMediaService:
                     async with session.get(source_url) as response:
                         await self._write_video_response(response, temp, max_bytes)
                     return
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - try the next CDN URL
                     temp.unlink(missing_ok=True)
                     failures.append(f"{cdn_host}: {exc}")
         detail = "；".join(failures[-3:]) or "没有可用 CDN 地址"
@@ -1018,7 +1093,9 @@ class BiliMediaService:
             headers["Cookie"] = str(self.bili_config["cookie"])
         timeout = aiohttp.ClientTimeout(total=180)
         max_bytes = self._max_bytes()
-        height = max(144, int(self.media_config.get("video_height") or 480))
+        height = _bounded_int(
+            self.media_config.get("video_height"), 480, 144, 2160
+        )
         quality = 64 if height >= 720 else 32 if height >= 480 else 16
         output = CACHE_DIR / f"{_safe_filename(bvid)}.mp4"
         temp = output.with_suffix(".mp4.part")
@@ -1116,7 +1193,9 @@ class BiliMediaService:
         if cached:
             return cached, track
 
-        height = max(144, int(self.media_config.get("video_height") or 480))
+        height = _bounded_int(
+            self.media_config.get("video_height"), 480, 144, 2160
+        )
         max_bytes = self._max_bytes()
         options = self._base_options()
         options.update(
@@ -1291,9 +1370,8 @@ class NeteaseService:
         return output
 
 
-@register("jrsq", "sakura", "每日术曲：B站视频、AI短评与定时推送", "4.4.0")
 class JRSQPlugin(Star):
-    SERVED_MEDIA_SUFFIXES = {
+    SERVED_MEDIA_SUFFIXES: ClassVar[set[str]] = {
         ".mp4",
         ".mkv",
         ".mov",
@@ -1325,7 +1403,7 @@ class JRSQPlugin(Star):
         ).strip()
         try:
             self.scheduler = AsyncIOScheduler(timezone=timezone_name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - timezone backends vary
             logger.warning(
                 "[jrsq] 无效时区 %s，回退到 Asia/Shanghai: %s",
                 timezone_name,
@@ -1563,7 +1641,7 @@ class JRSQPlugin(Star):
                                 )
                                 continue
                             return await self._bili_chain(track, prefix), "B站", track
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001 - try next candidate
                             candidate_errors.append(_error_text(exc))
                     raise MediaError(
                         "B站候选均不可发送: " + "；".join(candidate_errors[:3])
@@ -1579,12 +1657,12 @@ class JRSQPlugin(Star):
                             continue
                         try:
                             return await self._netease_chain(track), "网易云", track
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001 - try next candidate
                             candidate_errors.append(_error_text(exc))
                     raise MediaError(
                         "网易云候选均不可发送: " + "；".join(candidate_errors[:3])
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate optional providers
                 message = _error_text(exc)
                 errors.append(f"{current}: {message}")
                 logger.warning("[shuqu] %s 获取「%s」失败: %s", current, query, exc)
@@ -1662,7 +1740,7 @@ class JRSQPlugin(Star):
             )
             review = self._clean_review(response.completion_text or "", max_chars)
             return review or None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reviews must never break playback
             logger.warning("[jrsq] 术曲短评生成失败，已跳过: %s", exc)
             return None
 
@@ -1739,8 +1817,8 @@ class JRSQPlugin(Star):
             if review:
                 yield event.plain_result(f"💬 {review}")
         except Exception as exc:
-            logger.error("[shuqu] 指定曲目失败: %s", exc, exc_info=True)
-            yield event.plain_result(f"😢 没能获取「{query}」：{exc}")
+            logger.exception("[shuqu] 指定曲目失败")
+            yield event.plain_result(f"😢 没能获取「{query}」：{_error_text(exc)}")
 
     async def _command_help(
         self, event: AstrMessageEvent, _args: list[str] | None = None
@@ -1752,9 +1830,9 @@ class JRSQPlugin(Star):
             "/jrsq random  从本地曲库随机发送B站视频\n"
             "/jrsq list [页]  查看曲库\n"
             "/jrsq search <词>  搜索本地曲库\n"
-            "/jrsq add <BV号或链接>  添加视频\n"
-            "/jrsq sync  同步配置的B站收藏夹\n"
-            "/jrsq del <ID>  删除曲库条目\n"
+            "/jrsq add <BV号或链接>  添加视频（管理员）\n"
+            "/jrsq sync  同步配置的B站收藏夹（管理员）\n"
+            "/jrsq del <ID>  删除曲库条目（管理员）\n"
             "/jrsq bind | unbind  绑定/解绑当前群的每日推送（管理员）\n"
             "/jrsq status  查看视频、缓存和推送状态\n"
             "兼容别名：/shuqu。网易云为可选扩展，默认关闭。"
@@ -1783,8 +1861,8 @@ class JRSQPlugin(Star):
             )
             yield event.chain_result(chain)
         except Exception as exc:
-            logger.error("[shuqu] 随机推荐失败: %s", exc, exc_info=True)
-            yield event.plain_result(f"😢 随机推荐失败: {exc}")
+            logger.exception("[shuqu] 随机推荐失败")
+            yield event.plain_result(f"😢 随机推荐失败: {_error_text(exc)}")
 
     async def _command_list(self, event: AstrMessageEvent, args: list[str]):
         try:
@@ -1805,6 +1883,9 @@ class JRSQPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     async def _command_add(self, event: AstrMessageEvent, args: list[str]):
+        if not self._is_admin(event):
+            yield event.plain_result("⛔ 只有管理员可以修改本地曲库。")
+            return
         if not args:
             yield event.plain_result("⚠️ 用法：/shuqu add <BV号或B站链接>")
             return
@@ -1826,10 +1907,13 @@ class JRSQPlugin(Star):
                 f"✅ 已添加：{info['title']}\nUP主：{info['author']} | "
                 f"{_format_duration(info['duration'])}"
             )
-        except Exception as exc:
-            yield event.plain_result(f"😢 添加失败: {exc}")
+        except Exception as exc:  # noqa: BLE001 - command boundary
+            yield event.plain_result(f"😢 添加失败: {_error_text(exc)}")
 
     async def _command_delete(self, event: AstrMessageEvent, args: list[str]):
+        if not self._is_admin(event):
+            yield event.plain_result("⛔ 只有管理员可以修改本地曲库。")
+            return
         if not args:
             yield event.plain_result("⚠️ 用法：/shuqu del <曲目ID>")
             return
@@ -1862,6 +1946,9 @@ class JRSQPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     async def _command_sync(self, event: AstrMessageEvent, _args: list[str]):
+        if not self._is_admin(event):
+            yield event.plain_result("⛔ 只有管理员可以同步本地曲库。")
+            return
         media_id = str(self.bili_config.get("media_id") or "").strip()
         if not media_id:
             yield event.plain_result(
@@ -1874,7 +1961,8 @@ class JRSQPlugin(Star):
         yield event.plain_result(f"🔄 正在同步 B站收藏夹 {media_id}...")
         try:
             videos = await self.bili_api.fetch_fav_all(
-                media_id, int(self.bili_config.get("page_size") or 20)
+                media_id,
+                _bounded_int(self.bili_config.get("page_size"), 20, 1, 100),
             )
             existing = await self.db.get_all_bvids()
             added = skipped = failed = 0
@@ -1889,21 +1977,26 @@ class JRSQPlugin(Star):
                     else:
                         failed += 1
                     await asyncio.sleep(0.15)
-                except Exception:
+                except Exception:  # noqa: BLE001 - count failed favorite entries
                     failed += 1
             yield event.plain_result(
                 f"✅ 同步完成：新增 {added}，已存在 {skipped}，失败 {failed}，"
                 f"曲库共 {await self.db.count()} 首。"
             )
         except Exception as exc:
-            logger.error("[shuqu] 收藏夹同步失败: %s", exc, exc_info=True)
-            yield event.plain_result(f"😢 同步失败: {exc}")
+            logger.exception("[shuqu] 收藏夹同步失败")
+            yield event.plain_result(f"😢 同步失败: {_error_text(exc)}")
 
     async def _command_count(self, event: AstrMessageEvent, _args: list[str]):
         yield event.plain_result(f"📊 本地曲库共有 {await self.db.count()} 首术曲。")
 
     @staticmethod
     def _is_admin(event: AstrMessageEvent) -> bool:
+        try:
+            if event.is_admin():
+                return True
+        except (AttributeError, TypeError):
+            pass
         return str(getattr(event, "role", "member")).lower() in {"admin", "owner"}
 
     async def _command_bind(self, event: AstrMessageEvent, _args: list[str]):
@@ -1978,16 +2071,12 @@ class JRSQPlugin(Star):
                     "bilibili",
                     "🌞 每日术曲推荐",
                 )
-        except Exception as exc:
-            logger.error(
-                "[jrsq] 定时推送视频准备失败，不发送链接: %s",
-                _error_text(exc),
-                exc_info=True,
-            )
+        except Exception:
+            logger.exception("[jrsq] 定时推送视频准备失败，不发送链接")
             return
         for umo in targets:
             try:
                 await self.context.send_message(umo, MessageChain(components))
                 await asyncio.sleep(1)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - one target must not block others
                 logger.error("[shuqu] 推送到 %s 失败: %s", umo, _error_text(exc))

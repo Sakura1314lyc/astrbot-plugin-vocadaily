@@ -2,6 +2,7 @@ import unittest
 
 from search_logic import (
     assess_candidate,
+    derive_query_variants,
     normalize_search_text,
     parse_duration,
     rank_search_candidates,
@@ -160,6 +161,90 @@ class SearchLogicTests(unittest.TestCase):
             "千本樱",
         )
         self.assertEqual(assessment.match_quality, "rejected")
+
+    def test_fuzzy_chinese_title_variant_is_accepted(self):
+        ranked = rank_search_candidates(
+            [
+                {
+                    "bvid": "BV0000000012",
+                    "title": "アンノウン・マザーグース / 不为人知的鹅妈妈童谣",
+                    "author": "wowaka",
+                    "tags": ["初音ミク", "VOCALOID"],
+                    "duration": 269,
+                    "copyright": 1,
+                }
+            ],
+            "鹅妈妈的童谣",
+        )
+        self.assertEqual([item["bvid"] for item in ranked], ["BV0000000012"])
+        self.assertEqual(ranked[0]["search_match"], "fuzzy")
+
+    def test_original_outranks_audio_enhancement(self):
+        tracks = [
+            {
+                "bvid": "BV0000000013",
+                "title": "【音质提升】请批准吧灯神先生! / 重音テト・音街ウナ",
+                "author": "TRAP_CHICK_official",
+                "tags": ["VOCALOID"],
+                "duration": 203,
+                "copyright": 1,
+            },
+            {
+                "bvid": "BV0000000014",
+                "title": "【本家投稿】请批准吧灯神先生! / 重音テト・音街ウナ",
+                "author": "TRAP CHICK",
+                "tags": ["重音テト", "音街ウナ", "原创曲"],
+                "duration": 203,
+                "copyright": 1,
+            },
+        ]
+        ranked = rank_search_candidates(tracks, "请批准吧灯神先生!")
+        self.assertEqual(ranked[0]["bvid"], "BV0000000014")
+
+    def test_derives_canonical_title_from_top_result(self):
+        variants = derive_query_variants(
+            [
+                {
+                    "title": "【音质提升】《请批准吧灯神先生!》 / 重音テト・音街ウナ",
+                    "tags": ["VOCALOID", "重音テト"],
+                }
+            ],
+            "帮帮我吧神灯先生",
+        )
+        self.assertIn("请批准吧灯神先生", variants)
+
+    def test_hand_drawn_derivative_is_rejected(self):
+        assessment = assess_candidate(
+            {
+                "title": "【手书】千本樱 初音未来",
+                "tags": ["VOCALOID"],
+                "duration": 240,
+            },
+            "千本樱",
+        )
+        self.assertIn("手书", assessment.rejected_reason or "")
+
+    def test_duet_derivative_is_rejected(self):
+        assessment = assess_candidate(
+            {
+                "title": "《アンノウン・マザーグース》 wowaka + 初音ミク DUET",
+                "tags": ["初音ミク", "VOCALOID"],
+                "duration": 269,
+            },
+            "アンノウン・マザーグース",
+        )
+        self.assertIn("duet", (assessment.rejected_reason or "").lower())
+
+    def test_japanese_cover_is_rejected(self):
+        assessment = assess_candidate(
+            {
+                "title": "【重音テト】Unknown Mother Goose【UTAUカバー】",
+                "tags": ["重音テト", "UTAU"],
+                "duration": 269,
+            },
+            "Unknown Mother",
+        )
+        self.assertIn("カバー", assessment.rejected_reason or "")
 
 
 if __name__ == "__main__":

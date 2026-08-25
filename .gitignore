@@ -2,4 +2,6 @@ __pycache__/
 *.py[cod]
 *.db
 data/media_cache/
+data/cmd_config.json
+data/t2i_templates/
 .DS_Store

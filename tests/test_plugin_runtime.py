@@ -3,9 +3,10 @@ import socket
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
+from aiohttp import web
 
 _IMPORT_CWD = os.getcwd()
 _ASTRBOT_IMPORT_DIR = tempfile.TemporaryDirectory()
@@ -17,6 +18,22 @@ finally:
 
 
 class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_invalid_config_section_falls_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "plugin_config.json"
+            config_path.write_text(
+                '{"bilibili": "broken", "review": {"enabled": false}, '
+                '"push": {"target_umos": "not-a-list"}}',
+                encoding="utf-8",
+            )
+            with patch.object(main, "CONFIG_PATH", config_path):
+                config = main.load_plugin_config()
+
+        self.assertIsInstance(config["bilibili"], dict)
+        self.assertTrue(config["bilibili"]["enabled"])
+        self.assertFalse(config["review"]["enabled"])
+        self.assertEqual(config["push"]["target_umos"], [])
+
     async def test_search_falls_back_to_html_and_caches_result(self):
         service = main.BiliMediaService(
             {
@@ -56,6 +73,158 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tracks[0]["search_match"], "bvid")
         service.search.assert_not_awaited()
+
+    async def test_direct_bvid_normalizes_lowercase_prefix(self):
+        service = main.BiliMediaService({}, {})
+        service.enrich = AsyncMock(
+            return_value={
+                "bvid": "BV1CK4y1Y7r1",
+                "title": "天ノ弱／164 feat.GUMI【Official】",
+            }
+        )
+
+        await service.find_candidates("bv1CK4y1Y7r1")
+
+        self.assertEqual(service.enrich.await_args.args[0]["bvid"], "BV1CK4y1Y7r1")
+
+    async def test_search_api_bootstraps_anonymous_cookie(self):
+        async def homepage(_request):
+            response = web.Response(text="ok")
+            response.set_cookie("buvid3", "anonymous-session")
+            return response
+
+        async def search(request):
+            if request.cookies.get("buvid3") != "anonymous-session":
+                return web.Response(status=412)
+            return web.json_response(
+                {
+                    "code": 0,
+                    "data": {
+                        "result": [
+                            {
+                                "bvid": "BV0000000015",
+                                "title": "测试术曲 / 初音ミク",
+                                "author": "测试P",
+                                "duration": "03:00",
+                                "tag": "初音ミク,VOCALOID",
+                            }
+                        ]
+                    },
+                }
+            )
+
+        app = web.Application()
+        app.router.add_get("/", homepage)
+        app.router.add_get("/search", search)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            with (
+                patch.object(main, "BILI_HOME", f"http://localhost:{port}/"),
+                patch.object(
+                    main, "BILI_SEARCH_API", f"http://localhost:{port}/search"
+                ),
+            ):
+                tracks = await main.BiliMediaService({}, {})._search_api("测试术曲")
+            self.assertEqual(tracks[0]["bvid"], "BV0000000015")
+        finally:
+            await runner.cleanup()
+
+    async def test_find_candidates_retries_with_derived_title(self):
+        service = main.BiliMediaService(
+            {"search_suffix": "", "search_min_score": 90}, {}
+        )
+        first = [
+            {
+                "bvid": "BV0000000016",
+                "title": "【音质提升】《请批准吧灯神先生!》 / 重音テト・音街ウナ",
+                "tags": ["VOCALOID", "重音テト"],
+                "duration": 203,
+            }
+        ]
+        original = [
+            {
+                "bvid": "BV0000000017",
+                "title": "【本家投稿】请批准吧灯神先生! / 重音テト・音街ウナ",
+                "author": "TRAP CHICK",
+                "tags": ["重音テト", "音街ウナ", "原创曲"],
+                "duration": 203,
+                "copyright": 1,
+            }
+        ]
+
+        async def fake_search(query):
+            return original if "请批准" in query else first
+
+        service.search = AsyncMock(side_effect=fake_search)
+        service.enrich = AsyncMock(side_effect=lambda track: track)
+
+        tracks = await service.find_candidates("帮帮我吧神灯先生")
+
+        self.assertEqual(tracks[0]["bvid"], "BV0000000017")
+        self.assertTrue(
+            any("请批准" in call.args[0] for call in service.search.await_args_list)
+        )
+
+    async def test_fuzzy_match_gets_canonical_title_second_pass(self):
+        service = main.BiliMediaService(
+            {"search_suffix": "", "search_min_score": 90}, {}
+        )
+        translated = [
+            {
+                "bvid": "BV0000000018",
+                "title": "アンノウン・マザーグース / 不为人知的鹅妈妈童谣",
+                "tags": ["初音ミク", "VOCALOID"],
+                "duration": 269,
+            }
+        ]
+        original = [
+            {
+                "bvid": "BV0000000019",
+                "title": "アンノウン・マザーグース / wowaka feat. 初音ミク",
+                "author": "wowaka",
+                "tags": ["初音ミク", "VOCALOID", "原曲"],
+                "duration": 269,
+                "copyright": 1,
+            }
+        ]
+
+        async def fake_search(query):
+            return original if query.startswith("アンノウン") else translated
+
+        service.search = AsyncMock(side_effect=fake_search)
+        service.enrich = AsyncMock(side_effect=lambda track: track)
+
+        tracks = await service.find_candidates("鹅妈妈的童谣")
+
+        self.assertEqual(tracks[0]["bvid"], "BV0000000019")
+
+    async def test_ranking_enriches_best_candidate_beyond_first_batch(self):
+        service = main.BiliMediaService(
+            {"detail_count": 1, "search_min_score": 90}, {}
+        )
+        tracks = [
+            {
+                "bvid": f"BV{i:010d}",
+                "title": f"普通视频 {i}",
+                "duration": 180,
+            }
+            for i in range(12)
+        ]
+        tracks[-1]["title"] = "测试曲"
+
+        async def enrich(track):
+            return {**track, "tags": ["初音ミク", "VOCALOID"], "copyright": 1}
+
+        service.enrich = AsyncMock(side_effect=enrich)
+
+        ranked = await service.rank_candidates(tracks, "测试曲")
+
+        self.assertEqual(ranked[0]["bvid"], "BV0000000011")
+        self.assertEqual(service.enrich.await_args.args[0]["bvid"], "BV0000000011")
 
     async def test_internal_media_server_serves_cache_file(self):
         with socket.socket() as sock:
