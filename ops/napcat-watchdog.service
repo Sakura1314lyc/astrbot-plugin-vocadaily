@@ -1,0 +1,25 @@
+[Unit]
+Description=NapCat QQ and AstrBot connection watchdog
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/astrbot-stack/monitor/napcat_watchdog.py
+EnvironmentFile=/etc/napcat-watchdog.env
+Restart=always
+RestartSec=10
+User=root
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/napcat-watchdog
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

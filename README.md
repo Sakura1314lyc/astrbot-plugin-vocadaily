@@ -58,6 +58,12 @@ git clone https://github.com/Sakura1314lyc/astrbot-plugin-vocadaily.git
 
 如果 AstrBot 和 NapCat 分别跑在两个 Docker 容器里，本地文件路径通常不互通。这种情况下把 `media.delivery_mode` 设为 `url`，再把 `media.public_base_url` 填成 NapCat 能访问的地址，例如 `http://astrbot:6200`。这个端口只要在两个容器共用的 Docker 网络里连通即可，不用开放到公网。实际媒体地址还会带上每次启动随机生成的访问令牌。
 
+## NapCat 掉线监控
+
+`ops/napcat_watchdog.py` 是给自建服务器准备的独立监控。它不只检查 Docker 容器是否运行，还会读取 NapCat 与 AstrBot 的日志，识别 QQ 被踢下线、OneBot 断连以及服务恢复。通知通过 PushPlus 发到微信，Token 应只保存在服务器的 `/etc/napcat-watchdog.env`，不要提交到仓库。
+
+对应的 systemd 单元在 `ops/napcat-watchdog.service`。默认每 15 秒检查一次，掉线立即提醒，持续掉线时每 6 小时提醒一次，恢复后再发一条通知。
+
 ## 运行要求
 
 - AstrBot `4.19.2+`
