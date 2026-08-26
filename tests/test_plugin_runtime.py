@@ -60,7 +60,7 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         completion_text="节奏充满活力，华丽电子编曲特别抓耳，值得循环。"
                     ),
                     SimpleNamespace(
-                        completion_text="编曲确实抓耳，但作品用喘息与性暗示制造刺激，不能只当元气舞曲来夸。"
+                        completion_text="这首的电子编排很抓耳，我挺喜欢；不过喘息拟声和性暗示也是核心表达，题材接受度会因人而异。"
                     ),
                 ]
             )
@@ -81,6 +81,7 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("性暗示", review)
+        self.assertIn("挺喜欢", review)
         self.assertEqual(provider.text_chat.await_count, 2)
 
     async def test_problematic_review_is_retried_when_model_only_praises(self):
@@ -113,7 +114,7 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("翻唱", review)
         self.assertIn("生硬", review)
         self.assertEqual(provider.text_chat.await_count, 2)
-        self.assertIn("上一版短评回避了注意项", provider.text_chat.await_args_list[1].kwargs["prompt"])
+        self.assertIn("上一版短评需要校正", provider.text_chat.await_args_list[1].kwargs["prompt"])
 
     async def test_problematic_review_uses_fallback_after_two_evasive_answers(self):
         provider = SimpleNamespace(
@@ -139,9 +140,52 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "B站",
         )
 
-        self.assertIn("不能只往好处说", review)
+        self.assertIn("需要说清楚", review)
         self.assertIn("不适", review)
         self.assertEqual(provider.text_chat.await_count, 2)
+
+    async def test_normal_song_length_cannot_be_used_as_forced_criticism(self):
+        provider = SimpleNamespace(
+            text_chat=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(
+                        completion_text=(
+                            "轻快编曲有淡淡情感，不过短短的时长限制让情绪显得仓促，"
+                            "调声没有亮点，整体略显平淡。"
+                        )
+                    ),
+                    SimpleNamespace(
+                        completion_text=(
+                            "轻快的编曲和清爽调声很贴合月色主题，我会把它当作一首耐听的小品曲。"
+                        )
+                    ),
+                ]
+            )
+        )
+        plugin = object.__new__(main.JRSQPlugin)
+        plugin.review_config = {"enabled": True, "max_chars": 100}
+        plugin.context = SimpleNamespace(get_using_provider=lambda _origin: provider)
+
+        review = await plugin._generate_review(
+            SimpleNamespace(unified_msg_origin="group:test"),
+            "好想听你说月色真美",
+            {
+                "title": "【本家】月が綺麗ねと言われたい！ - 初音ミク",
+                "tags": ["VOCALOID", "初音ミク", "原创曲"],
+                "duration": 147,
+                "search_match": "title",
+                "search_score": 220,
+                "search_original": True,
+            },
+            "B站",
+        )
+
+        self.assertIn("耐听", review)
+        self.assertNotIn("仓促", review)
+        self.assertEqual(provider.text_chat.await_count, 2)
+        retry_prompt = provider.text_chat.await_args_list[1].kwargs["prompt"]
+        self.assertIn("属于正常单曲范围", retry_prompt)
+        self.assertIn("语气失衡", retry_prompt)
 
     def test_invalid_config_section_falls_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as directory:

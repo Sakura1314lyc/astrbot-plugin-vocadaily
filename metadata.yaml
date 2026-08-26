@@ -2,7 +2,7 @@ name: astrbot_plugin_jrsq
 display_name: 今日术曲
 short_desc: 在群里点播术曲视频，附 AI 短评，也能每天定时推送。
 desc: 更可靠地搜索术曲原曲、发送完整视频、生成短评并定时推送。
-version: 4.8.0
+version: 4.8.1
 author: sakura
 repo: https://github.com/Sakura1314lyc/astrbot-plugin-vocadaily
 astrbot_version: ">=4.19.2,<5"

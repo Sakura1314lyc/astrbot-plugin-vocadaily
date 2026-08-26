@@ -372,7 +372,7 @@ _REVIEW_CAUTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # They add context to the review but never block playback.
 _KNOWN_REVIEW_CAUTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
-        "作品以明显的性暗示、喘息拟声或挑逗表达为核心，不能包装成单纯元气可爱",
+        "作品包含明显的性暗示、喘息拟声或挑逗表达，评价时要说明题材但不能据此断定音乐质量差",
         (
             "威风堂堂",
             "威風堂々",
@@ -456,10 +456,61 @@ def _review_acknowledges_caution(review: str, cautions: list[str]) -> bool:
 
 def _caution_review_fallback(cautions: list[str], max_chars: int) -> str:
     concern = cautions[0].rstrip("。；; ")
-    text = f"这次不能只往好处说：{concern}。只凭现有信息，我不会替它硬下正面结论。"
+    text = f"有一点需要说清楚：{concern}。这不直接等于作品不好听，最终感受仍会因人而异。"
     if len(text) > max_chars:
         text = text[:max_chars].rstrip("，,；;、 ") + "……"
     return text
+
+
+_REVIEW_NEGATIVE_MARKERS = (
+    "仓促",
+    "平淡",
+    "乏味",
+    "单调",
+    "没有亮点",
+    "没什么亮点",
+    "不耐听",
+    "生硬",
+    "粗糙",
+    "廉价",
+    "难听",
+    "不好听",
+    "失败",
+    "拉胯",
+    "刺耳",
+    "混乱",
+    "接受度低",
+    "不成熟",
+)
+
+
+def _review_quality_issues(
+    review: str, track: dict[str, Any], cautions: list[str]
+) -> list[str]:
+    """Catch criticism that is contradicted by metadata or piled on for tone."""
+
+    issues: list[str] = []
+    duration = parse_duration(track.get("duration"))
+    duration_complaint = re.search(
+        r"(?:时长|篇幅).{0,10}(?:太短|过短|短暂|限制|仓促|展开不足)"
+        r"|(?:短短|太短|过短).{0,12}(?:仓促|限制|展开|表达|情绪)",
+        review,
+    )
+    has_duration_caution = any(
+        "不足 50 秒" in caution or "超过 15 分钟" in caution
+        for caution in cautions
+    )
+    if 60 <= duration <= 600 and duration_complaint and not has_duration_caution:
+        issues.append(
+            f"视频时长 {_format_duration(duration)} 属于正常单曲范围，不能据此批评作品仓促"
+        )
+
+    negative_hits = {
+        marker for marker in _REVIEW_NEGATIVE_MARKERS if marker in review
+    }
+    if len(negative_hits) >= 3:
+        issues.append("一段短评连续堆叠了多个负面判断，语气失衡")
+    return issues
 
 
 class SongDB:
@@ -2068,13 +2119,17 @@ class JRSQPlugin(Star):
         cautions = _derive_review_cautions(track)
         metadata["自动检查出的注意项"] = cautions
         system_prompt = (
-            "你是群聊里认真听术曲、也敢说缺点的爱好者。请以机器人自己的第一人称口吻，"
-            "为刚分享的作品写一段有判断力的短评，不要为了活跃气氛默认夸赞。"
-            "先在心里核对作品身份、版本、题材和信息可信度，再决定评价是正面、中性还是负面。"
+            "你是群聊里认真听术曲、口味鲜明但不刻薄的爱好者。请以机器人自己的第一人称口吻，"
+            "为刚分享的作品写一段有依据的短评。目标既不是无脑夸，也不是为了显得专业而硬挑缺点；"
+            "作品确实讨喜时可以自然地给出正面评价。先核对作品身份、版本、题材和信息可信度，"
+            "再决定评价是正面、中性还是负面。"
             "熟悉作品时可以谈公认的曲风、编曲、调声、情绪和内容争议；不熟悉时只能依据元数据，"
             "宁可坦白信息不足，也不要套用可爱、治愈、经典、甜蜜、神曲等万能好评。"
-            "如果元数据中的注意项非空，最终短评必须自然地体现至少一项，不能先夸一通再轻描淡写。"
-            "可以明确说不好听、不成熟、接受度低或题材令人不适，但只批评作品和当前版本，"
+            "如果元数据中的注意项非空，最终短评必须自然地说明至少一项；但题材敏感、版本特殊"
+            "只是一项事实，不自动代表编曲、旋律或调声很差，可以同时承认作品好听或抓耳。"
+            "如果注意项为空，不得为了营造锐评感连续罗列缺点。正常术曲时长大约一到五分钟，"
+            "除非注意项明确说视频过短或过长，否则不要拿时长批评情绪展开。"
+            "确有依据时可以说不好听、不成熟或令人不适，但只评价作品和当前版本，"
             "不攻击创作者或听众，也不传播无法确认的指控。"
             "不要编造具体歌词、创作背景或自己已经完整听过视频。"
             f"只输出一到两句话的短评正文，不列点、不加标题、不打分，不超过{max_chars}个字。"
@@ -2099,22 +2154,44 @@ class JRSQPlugin(Star):
 
             response = await request_review(prompt)
             review = self._clean_review(response.completion_text or "", max_chars)
-            if cautions and review and not _review_acknowledges_caution(
-                review, cautions
-            ):
+            missed_caution = bool(
+                cautions
+                and review
+                and not _review_acknowledges_caution(review, cautions)
+            )
+            quality_issues = _review_quality_issues(review, track, cautions)
+            if review and (missed_caution or quality_issues):
+                reasons: list[str] = []
+                if missed_caution:
+                    reasons.append("没有说明自动检查出的注意项")
+                reasons.extend(quality_issues)
                 retry_prompt = (
-                    f"{prompt}\n\n上一版短评回避了注意项，只给出了泛化评价："
+                    f"{prompt}\n\n上一版短评需要校正："
                     f"{json.dumps(review, ensure_ascii=False)}\n"
-                    "请重写。必须明确指出至少一项注意内容及其对作品或这个版本的影响，"
-                    "不要用空泛好话抵消问题。仍然只输出短评正文。"
+                    f"问题是：{'；'.join(reasons)}。请重写成更公平的个人感受。"
+                    "有注意项就清楚说明，但不要把题材或版本问题直接推导成音乐难听；"
+                    "没有证据的缺点要删掉，也不要改成空泛吹捧。仍然只输出短评正文。"
                 )
                 response = await request_review(retry_prompt)
                 review = self._clean_review(
                     response.completion_text or "", max_chars
                 )
-                if review and not _review_acknowledges_caution(review, cautions):
+                if (
+                    cautions
+                    and review
+                    and not _review_acknowledges_caution(review, cautions)
+                ):
                     logger.info("[jrsq] 大模型两次回避评价注意项，使用中性短评兜底")
                     return _caution_review_fallback(cautions, max_chars)
+                remaining_issues = _review_quality_issues(review, track, cautions)
+                if remaining_issues:
+                    logger.info("[jrsq] 大模型两次给出失衡短评，使用中性短评兜底")
+                    if cautions:
+                        return _caution_review_fallback(cautions, max_chars)
+                    return self._clean_review(
+                        "这首曲子的取向可能见仁见智，但现有信息不足以支撑连续下负面结论，我更愿意保留一点余地。",
+                        max_chars,
+                    )
             return review or None
         except Exception as exc:  # noqa: BLE001 - reviews must never break playback
             logger.warning("[jrsq] 术曲短评生成失败，已跳过: %s", exc)
