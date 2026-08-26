@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="shuqu-avatar.png" alt="今日术曲" width="200">
+  <img src="jrsq-avatar.png" alt="今日术曲" width="200">
 </p>
 
 # 今日术曲
@@ -37,8 +37,6 @@ git clone https://github.com/Sakura1314lyc/astrbot-plugin-vocadaily.git
 - `/jrsq bind`：把当前群加入每日推送（需要管理员权限）
 
 不想再收每日推送时，用 `/jrsq unbind` 解绑。曲库同步、增删和状态查看等管理指令没有全塞在这里，发 `/jrsq help` 就能看到。
-
-以前用过 `/shuqu` 的话不用改习惯，旧命令仍然兼容。
 
 点名曲目后那段短评由 AstrBot 当前启用的大模型生成，默认不超过 100 字。短评会先检查投稿版本、题材风险和检索可信度，不会固定说好话；碰到翻唱、二创、AI 版本、争议或可能引起不适的内容时会直接说明。它可以通过 `review.enabled` 关闭，长度则由 `review.max_chars` 控制。随机推荐和每日推送不会额外发短评。
 

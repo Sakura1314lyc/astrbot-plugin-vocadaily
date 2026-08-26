@@ -250,7 +250,7 @@ def load_plugin_config() -> dict[str, Any]:
                 merged[section][key] = list(DEFAULT_CONFIG[section][key])
         return merged
     except (OSError, TypeError, json.JSONDecodeError) as exc:
-        logger.error("[shuqu] 读取配置失败，使用默认配置: %s", exc)
+        logger.error("[jrsq] 读取配置失败，使用默认配置: %s", exc)
         return _deep_merge(DEFAULT_CONFIG, {})
 
 
@@ -1149,7 +1149,7 @@ class BiliMediaService:
             return await self._download_progressive(track)
         except MediaError as progressive_error:
             logger.info(
-                "[shuqu] B站单文件 MP4 获取失败，尝试 yt-dlp: %s", progressive_error
+                "[jrsq] B站单文件 MP4 获取失败，尝试 yt-dlp: %s", progressive_error
             )
             try:
                 return await asyncio.to_thread(self._download_sync, track)
@@ -1633,7 +1633,7 @@ class JRSQPlugin(Star):
                 "cron",
                 hour=_bounded_int(self.push_config.get("cron_hour"), 12, 0, 23),
                 minute=_bounded_int(self.push_config.get("cron_minute"), 0, 0, 59),
-                id="shuqu_daily_push",
+                id="jrsq_daily_push",
                 replace_existing=True,
                 coalesce=True,
                 max_instances=1,
@@ -1643,7 +1643,7 @@ class JRSQPlugin(Star):
             self._scheduled_cleanup,
             "interval",
             hours=1,
-            id="shuqu_cache_cleanup",
+            id="jrsq_cache_cleanup",
             replace_existing=True,
             coalesce=True,
             max_instances=1,
@@ -1657,7 +1657,7 @@ class JRSQPlugin(Star):
         await self._start_media_server()
         if not self.scheduler.running:
             self.scheduler.start()
-        logger.info("[shuqu] 初始化完成，曲库 %s 首", await self.db.count())
+        logger.info("[jrsq] 初始化完成，曲库 %s 首", await self.db.count())
 
     async def terminate(self) -> None:
         if self.scheduler.running:
@@ -1763,7 +1763,7 @@ class JRSQPlugin(Star):
                 if path.is_file() and path.stat().st_mtime < deadline:
                     path.unlink()
             except OSError as exc:
-                logger.warning("[shuqu] 清理缓存失败 %s: %s", path, exc)
+                logger.warning("[jrsq] 清理缓存失败 %s: %s", path, exc)
 
     async def _scheduled_cleanup(self) -> None:
         await asyncio.to_thread(self._cleanup_cache)
@@ -1882,7 +1882,7 @@ class JRSQPlugin(Star):
             except Exception as exc:  # noqa: BLE001 - isolate optional providers
                 message = _error_text(exc)
                 errors.append(f"{current}: {message}")
-                logger.warning("[shuqu] %s 获取「%s」失败: %s", current, query, exc)
+                logger.warning("[jrsq] %s 获取「%s」失败: %s", current, query, exc)
         raise MediaError("；".join(errors) or "没有启用可用的音乐来源")
 
     @staticmethod
@@ -2004,7 +2004,7 @@ class JRSQPlugin(Star):
             or "千本樱"
         )
 
-    @filter.command("jrsq", alias={"shuqu"})
+    @filter.command("jrsq")
     async def command_jrsq(self, event: AstrMessageEvent):
         """每日术曲：搜索 B站并发送完整视频；/jrsq help 查看用法。"""
         parts = event.message_str.strip().split()
@@ -2063,7 +2063,7 @@ class JRSQPlugin(Star):
             if review:
                 yield event.plain_result(f"💬 {review}")
         except Exception as exc:
-            logger.exception("[shuqu] 指定曲目失败")
+            logger.exception("[jrsq] 指定曲目失败")
             yield event.plain_result(f"😢 没能获取「{query}」：{_error_text(exc)}")
 
     async def _command_help(
@@ -2081,7 +2081,7 @@ class JRSQPlugin(Star):
             "/jrsq del <ID>  删除曲库条目（管理员）\n"
             "/jrsq bind | unbind  绑定/解绑当前群的每日推送（管理员）\n"
             "/jrsq status  查看视频、缓存和推送状态\n"
-            "兼容别名：/shuqu。网易云为可选扩展，默认关闭。"
+            "网易云为可选扩展，默认关闭。"
         )
 
     async def _command_random(
@@ -2107,7 +2107,7 @@ class JRSQPlugin(Star):
             )
             yield event.chain_result(chain)
         except Exception as exc:
-            logger.exception("[shuqu] 随机推荐失败")
+            logger.exception("[jrsq] 随机推荐失败")
             yield event.plain_result(f"😢 随机推荐失败: {_error_text(exc)}")
 
     async def _command_list(self, event: AstrMessageEvent, args: list[str]):
@@ -2133,7 +2133,7 @@ class JRSQPlugin(Star):
             yield event.plain_result("⛔ 只有管理员可以修改本地曲库。")
             return
         if not args:
-            yield event.plain_result("⚠️ 用法：/shuqu add <BV号或B站链接>")
+            yield event.plain_result("⚠️ 用法：/jrsq add <BV号或B站链接>")
             return
         bvid = _extract_bvid(" ".join(args))
         if not bvid:
@@ -2161,7 +2161,7 @@ class JRSQPlugin(Star):
             yield event.plain_result("⛔ 只有管理员可以修改本地曲库。")
             return
         if not args:
-            yield event.plain_result("⚠️ 用法：/shuqu del <曲目ID>")
+            yield event.plain_result("⚠️ 用法：/jrsq del <曲目ID>")
             return
         try:
             song_id = int(args[0])
@@ -2177,7 +2177,7 @@ class JRSQPlugin(Star):
     async def _command_local_search(self, event: AstrMessageEvent, args: list[str]):
         keyword = " ".join(args).strip()
         if not keyword:
-            yield event.plain_result("⚠️ 用法：/shuqu search <关键词>")
+            yield event.plain_result("⚠️ 用法：/jrsq search <关键词>")
             return
         songs = await self.db.search(keyword)
         if not songs:
@@ -2230,7 +2230,7 @@ class JRSQPlugin(Star):
                 f"曲库共 {await self.db.count()} 首。"
             )
         except Exception as exc:
-            logger.exception("[shuqu] 收藏夹同步失败")
+            logger.exception("[jrsq] 收藏夹同步失败")
             yield event.plain_result(f"😢 同步失败: {_error_text(exc)}")
 
     async def _command_count(self, event: AstrMessageEvent, _args: list[str]):
@@ -2325,4 +2325,4 @@ class JRSQPlugin(Star):
                 await self.context.send_message(umo, MessageChain(components))
                 await asyncio.sleep(1)
             except Exception as exc:  # noqa: BLE001 - one target must not block others
-                logger.error("[shuqu] 推送到 %s 失败: %s", umo, _error_text(exc))
+                logger.error("[jrsq] 推送到 %s 失败: %s", umo, _error_text(exc))
