@@ -60,9 +60,19 @@ HARD_NEGATIVE_MARKERS = (
     "mad",
     "amv",
     "mmd",
+    "magical mirai",
+    "魔法未来",
+    "演唱会",
+    "演唱會",
+    "concert",
+    "live",
+    "project diva",
+    "歌姬计划",
+    "歌姬計畫",
     "宅舞",
     "手书",
     "手書き",
+    "手描",
     "描改",
     "试跳",
     "試跳",
@@ -72,6 +82,10 @@ HARD_NEGATIVE_MARKERS = (
     "真人版",
     "钢琴",
     "鋼琴",
+    "琴谱",
+    "琴譜",
+    "扒谱",
+    "扒譜",
     "小提琴",
     "古筝",
     "古箏",
@@ -108,6 +122,12 @@ HARD_NEGATIVE_MARKERS = (
     "二創",
     "同人动画",
     "同人動畫",
+    "短视频",
+    "短視頻",
+    "动画片段",
+    "動畫片段",
+    "游戏片段",
+    "遊戲片段",
     "搞笑",
     "背景素材",
     "鸣潮",
@@ -118,6 +138,17 @@ HARD_NEGATIVE_MARKERS = (
     "火影",
     "cosplay",
     "cos",
+    "双声道",
+    "雙聲道",
+    "纯人声",
+    "純人聲",
+    "8bit",
+    "8-bit",
+    "fnf",
+    "一小时循环",
+    "一小時循環",
+    "循环播放",
+    "循環播放",
 )
 
 SOFT_NEGATIVE_MARKERS = (
@@ -138,6 +169,11 @@ SOFT_NEGATIVE_MARKERS = (
     "但是",
     "中文字幕",
     "字幕版",
+    "中字",
+    "修复",
+    "修復",
+    "高质量",
+    "高質量",
     "音质提升",
     "音質提升",
     "高音质",
@@ -193,6 +229,19 @@ ORIGINAL_MARKERS = (
     "オリジナル",
     "original",
     "feat",
+)
+
+STRONG_ORIGINAL_MARKERS = (
+    "本家投稿",
+    "本家",
+    "原曲",
+    "原版pv",
+    "原版",
+    "原创曲",
+    "原創曲",
+    "オリジナル",
+    "official",
+    "original",
 )
 
 
@@ -268,13 +317,89 @@ def _best_title_similarity(title: str, query: str) -> float:
     query_norm = normalize_search_text(query)
     if len(query_norm) < 4:
         return 0.0
-    return max(
-        (
-            SequenceMatcher(None, query_norm, variant, autojunk=False).ratio()
-            for variant in _title_match_variants(title)
-        ),
-        default=0.0,
+
+    def ngram_dice(left: str, right: str) -> float:
+        size = 2 if min(len(left), len(right)) < 8 else 3
+        left_parts = {
+            left[index : index + size]
+            for index in range(len(left) - size + 1)
+        }
+        right_parts = {
+            right[index : index + size] for index in range(len(right) - size + 1)
+        }
+        if not left_parts or not right_parts:
+            return 0.0
+        return 2 * len(left_parts & right_parts) / (len(left_parts) + len(right_parts))
+
+    similarities: list[float] = []
+    for variant in _title_match_variants(title):
+        sequence = SequenceMatcher(None, query_norm, variant, autojunk=False).ratio()
+        similarities.append(max(sequence, ngram_dice(query_norm, variant)))
+    return max(similarities, default=0.0)
+
+
+_REQUEST_PREFIX_PATTERNS = (
+    re.compile(
+        r"^(?:麻烦|麻煩|请|請)?(?:给我|給我|帮我|幫我)?"
+        r"(?:播放|放一下|放首|放|来一首|來一首|来首|來首|点播|點播|搜索|搜|找)"
+        r"(?:一下|一首|首)?[：:、,，\s]*"
+    ),
+    re.compile(
+        r"^(?:我)?(?:想听听|想聽聽|想听|想聽|要听|要聽)"
+        r"(?:一下|一首|首)?[：:、,，\s]*"
+    ),
+)
+_REQUEST_SUFFIX_RE = re.compile(
+    r"(?:这首歌|這首歌|这首|這首)?(?:可以吗|可以嗎|行吗|行嗎|谢谢|謝謝)[?？!！\s]*$"
+)
+
+
+def derive_request_query_variants(query: str, *, limit: int = 5) -> list[str]:
+    """Turn conversational song requests into bounded search aliases.
+
+    The original input is always kept.  This matters for titles that really do
+    begin with words such as ``想听``; cleaned forms are extra retrieval probes,
+    not destructive rewrites.
+    """
+
+    raw = " ".join(unicodedata.normalize("NFKC", str(query or "")).split()).strip()
+    values: list[str] = [raw] if raw else []
+    values.extend(
+        match.group("title").strip() for match in _QUOTED_TITLE_RE.finditer(raw)
     )
+
+    # Spoken requests such as “想听你说月色真美” contain both a request verb
+    # and a likely remembered lyric/title.  Keep both useful granularities.
+    spoken_title = re.match(
+        r"^(?:我)?(?:想听|想聽|想听听|想聽聽)(?:你|妳)(?:对我|對我)?说(?P<title>.{2,60})$",
+        raw,
+    )
+    if spoken_title:
+        values.append(spoken_title.group("title").strip())
+
+    cleaned = raw
+    for pattern in _REQUEST_PREFIX_PATTERNS:
+        candidate = pattern.sub("", cleaned, count=1).strip()
+        if candidate != cleaned:
+            cleaned = candidate
+            values.append(cleaned)
+            break
+    suffix_cleaned = _REQUEST_SUFFIX_RE.sub("", cleaned).strip()
+    if suffix_cleaned and suffix_cleaned != cleaned:
+        values.append(suffix_cleaned)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value = value.strip(" \t\r\n-—–:：,，!！?？'\"")
+        normalized = normalize_search_text(value)
+        if len(normalized) < 2 or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def derive_query_variants(
@@ -340,10 +465,15 @@ class CandidateAssessment:
     title_match: bool
     song_signal: bool
     rejected_reason: str | None = None
+    original_signal: bool = False
 
 
 def assess_candidate(
-    track: dict[str, Any], query: str, *, position: int = 0
+    track: dict[str, Any],
+    query: str,
+    *,
+    position: int = 0,
+    query_variants: Iterable[str] | None = None,
 ) -> CandidateAssessment:
     """Score a candidate while keeping exclusion reasons observable."""
 
@@ -353,7 +483,15 @@ def assess_candidate(
     description = str(track.get("description") or "")
     category = str(track.get("category") or "")
     title_norm = normalize_search_text(title)
-    query_norm = normalize_search_text(query)
+    query_pairs: list[tuple[str, str]] = []
+    query_seen: set[str] = set()
+    for value in [query, *(query_variants or [])]:
+        normalized = normalize_search_text(value)
+        if normalized and normalized not in query_seen:
+            query_seen.add(normalized)
+            query_pairs.append((str(value), normalized))
+    query_values = [normalized for _, normalized in query_pairs]
+    query_norm = query_values[0] if query_values else ""
     metadata = f"{title} {author} {tags} {description} {category}"
     metadata_norm = normalize_search_text(metadata)
 
@@ -365,7 +503,7 @@ def assess_candidate(
         return CandidateAssessment(
             -1000,
             "rejected",
-            query_norm in title_norm,
+            any(value in title_norm for value in query_values),
             False,
             f"标题含排除词：{hard_negatives[0]}",
         )
@@ -374,38 +512,68 @@ def assess_candidate(
         return CandidateAssessment(
             -1000,
             "rejected",
-            query_norm in title_norm,
+            any(value in title_norm for value in query_values),
             False,
             f"标签含排除词：{tagged_negatives[0]}",
         )
 
-    if title_norm == query_norm:
-        score, match_quality = 160, "exact"
-    elif title_norm.startswith(query_norm):
-        score, match_quality = 130, "prefix"
-    elif query_norm in title_norm:
-        score, match_quality = 105, "title"
-    elif _best_title_similarity(title, query) >= 0.60:
-        score, match_quality = 92, "fuzzy"
-    elif query_norm in metadata_norm:
-        score, match_quality = 35, "metadata"
-    else:
-        score, match_quality = -70, "none"
+    match_candidates: list[tuple[int, str]] = []
+    for value, normalized in query_pairs:
+        if title_norm == normalized:
+            match_candidates.append((150, "exact"))
+        elif title_norm.startswith(normalized):
+            match_candidates.append((128, "prefix"))
+        elif normalized in title_norm:
+            match_candidates.append((105, "title"))
+        elif _best_title_similarity(title, value) >= 0.62:
+            match_candidates.append((90, "fuzzy"))
+        elif normalized in metadata_norm:
+            match_candidates.append((35, "metadata"))
+        else:
+            match_candidates.append((-70, "none"))
+    score, match_quality = max(match_candidates, default=(-70, "none"))
 
     signal_context = f"{title} {author} {tags} {category}"
     vocal_title = bool(_find_markers(f"{title} {tags}", VOCAL_SYNTH_MARKERS))
     vocal_metadata = bool(_find_markers(signal_context, VOCAL_SYNTH_MARKERS))
     original_title = bool(_find_markers(title, ORIGINAL_MARKERS))
     original_metadata = bool(_find_markers(signal_context, ORIGINAL_MARKERS))
+    strong_original_title = bool(_find_markers(title, STRONG_ORIGINAL_MARKERS))
+    strong_original_metadata = bool(
+        _find_markers(f"{author} {tags} {category}", STRONG_ORIGINAL_MARKERS)
+    )
+    home_upload_title = bool(_find_markers(title, ("本家投稿", "本家")))
+    home_upload_metadata = bool(
+        _find_markers(f"{author} {tags} {category}", ("本家投稿", "本家"))
+    )
     official_author = _marker_present(author, "official") or "官方" in author
     song_signal = vocal_metadata or original_metadata or official_author
+    original_signal = strong_original_title or strong_original_metadata or official_author
+
+    if _marker_present(title, "ai") and not strong_original_title:
+        return CandidateAssessment(
+            score=-1000,
+            match_quality="rejected",
+            title_match=match_quality in {"exact", "prefix", "title", "fuzzy"},
+            song_signal=song_signal,
+            rejected_reason="标题标注 AI 版本",
+            original_signal=False,
+        )
 
     if vocal_title:
         score += 30
     elif vocal_metadata:
         score += 18
-    if original_title:
-        score += 40
+    if home_upload_title:
+        score += 86
+    elif strong_original_title:
+        score += 56
+    elif original_title:
+        score += 34
+    elif home_upload_metadata:
+        score += 44
+    elif strong_original_metadata:
+        score += 24
     elif original_metadata:
         score += 12
     if official_author:
@@ -413,7 +581,7 @@ def assess_candidate(
     if _safe_int(track.get("copyright")) == 1:
         score += 10
     if not song_signal:
-        score -= 32
+        score -= 80
     elif match_quality == "metadata" and position <= 2:
         # B站搜索偶尔只在简介或标签保留日文原名，标题已经换成中文译名。
         # 仅给搜索页最前面的强术曲信号结果加权，避免普通视频借简介蹭分。
@@ -425,6 +593,15 @@ def assess_candidate(
         score -= 8
 
     duration = parse_duration(track.get("duration"))
+    if 0 < duration < 50 and not original_signal:
+        return CandidateAssessment(
+            score=-1000,
+            match_quality="rejected",
+            title_match=match_quality in {"exact", "prefix", "title", "fuzzy"},
+            song_signal=song_signal,
+            rejected_reason="时长过短，疑似片段或短视频",
+            original_signal=original_signal,
+        )
     if 60 <= duration <= 600:
         score += 8
     elif 20 <= duration <= 900:
@@ -445,11 +622,16 @@ def assess_candidate(
         match_quality=match_quality,
         title_match=match_quality in {"exact", "prefix", "title", "fuzzy"},
         song_signal=song_signal,
+        original_signal=original_signal,
     )
 
 
 def rank_search_candidates(
-    tracks: Iterable[dict[str, Any]], query: str, *, minimum_score: int = 90
+    tracks: Iterable[dict[str, Any]],
+    query: str,
+    *,
+    minimum_score: int = 90,
+    query_variants: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return safe, relevant candidates sorted by confidence."""
 
@@ -462,17 +644,26 @@ def rank_search_candidates(
             continue
         if identity:
             seen.add(identity)
-        assessment = assess_candidate(track, query, position=position)
+        effective_position = _safe_int(track.get("best_search_position"))
+        if "best_search_position" not in track:
+            effective_position = position
+        assessment = assess_candidate(
+            track,
+            query,
+            position=effective_position,
+            query_variants=query_variants,
+        )
         track["search_score"] = assessment.score
         track["search_match"] = assessment.match_quality
+        track["search_original"] = assessment.original_signal
         if assessment.rejected_reason:
             track["search_rejected_reason"] = assessment.rejected_reason
             continue
         metadata_match_allowed = assessment.song_signal and (
             assessment.score >= minimum_score + 20
-            or (position <= 2 and assessment.score >= minimum_score)
+            or (effective_position <= 2 and assessment.score >= minimum_score)
         )
-        if assessment.score < minimum_score or not (
+        if not assessment.song_signal or assessment.score < minimum_score or not (
             assessment.title_match or metadata_match_allowed
         ):
             continue
@@ -481,6 +672,7 @@ def rank_search_candidates(
     ranked.sort(
         key=lambda item: (
             int(item.get("search_score") or 0),
+            bool(item.get("search_original")),
             _safe_int(item.get("favorites")),
             _safe_int(item.get("play")),
         ),

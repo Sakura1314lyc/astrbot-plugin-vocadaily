@@ -169,6 +169,42 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
             any("请批准" in call.args[0] for call in service.search.await_args_list)
         )
 
+    async def test_find_candidates_does_not_stop_before_original_suffix_search(self):
+        service = main.BiliMediaService(
+            {"search_suffix": "VOCALOID 原曲 MV", "search_min_score": 90}, {}
+        )
+        live = [
+            {
+                "bvid": "BV0000000026",
+                "title": "世界第一公主殿下 Magical Mirai 2018",
+                "tags": ["初音未来", "VOCALOID", "演唱会"],
+                "duration": 302,
+            }
+        ]
+        original = [
+            {
+                "bvid": "BV0000000027",
+                "title": "[原版PV]初音未来《世界第一公主殿下 World is Mine》",
+                "author": "ryo",
+                "tags": ["初音未来", "VOCALOID", "原曲"],
+                "duration": 254,
+                "copyright": 1,
+            }
+        ]
+
+        async def fake_search(query):
+            return original if "原曲" in query else live
+
+        service.search = AsyncMock(side_effect=fake_search)
+        service.enrich = AsyncMock(side_effect=lambda track: track)
+
+        tracks = await service.find_candidates("世界第一公主殿下")
+
+        self.assertEqual(tracks[0]["bvid"], "BV0000000027")
+        self.assertTrue(
+            any("原曲" in call.args[0] for call in service.search.await_args_list)
+        )
+
     async def test_fuzzy_match_gets_canonical_title_second_pass(self):
         service = main.BiliMediaService(
             {"search_suffix": "", "search_min_score": 90}, {}

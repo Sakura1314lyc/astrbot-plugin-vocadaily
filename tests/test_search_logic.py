@@ -3,6 +3,7 @@ import unittest
 from search_logic import (
     assess_candidate,
     derive_query_variants,
+    derive_request_query_variants,
     normalize_search_text,
     parse_duration,
     rank_search_candidates,
@@ -10,6 +11,18 @@ from search_logic import (
 
 
 class SearchLogicTests(unittest.TestCase):
+    def test_derives_spoken_request_aliases_without_losing_original(self):
+        variants = derive_request_query_variants("想听你说月色真美")
+
+        self.assertEqual(variants[0], "想听你说月色真美")
+        self.assertIn("你说月色真美", variants)
+        self.assertIn("月色真美", variants)
+
+    def test_extracts_quoted_title_from_polite_request(self):
+        variants = derive_request_query_variants("请给我播放一下《千本樱》可以吗")
+
+        self.assertIn("千本樱", variants)
+
     def test_normalizes_common_title_variants(self):
         self.assertEqual(normalize_search_text("千本桜"), "千本樱")
         self.assertEqual(normalize_search_text("強風 オールバック"), "强风オールバック")
@@ -87,6 +100,80 @@ class SearchLogicTests(unittest.TestCase):
             minimum_score=90,
         )
         self.assertEqual(ranked, [])
+
+    def test_exact_short_title_without_song_evidence_is_rejected(self):
+        ranked = rank_search_candidates(
+            [
+                {
+                    "bvid": "BV0000000020",
+                    "title": "想听你说月色真美",
+                    "tags": ["碧蓝档案", "日语学习"],
+                    "duration": 34,
+                    "play": 2_000_000,
+                }
+            ],
+            "想听你说月色真美",
+        )
+
+        self.assertEqual(ranked, [])
+
+    def test_original_pv_outranks_live_and_mmd_versions(self):
+        tracks = [
+            {
+                "bvid": "BV0000000021",
+                "title": "【4K】世界第一公主殿下 Magical Mirai 2018",
+                "tags": ["初音未来", "VOCALOID", "演唱会"],
+                "duration": 302,
+                "play": 20_000_000,
+            },
+            {
+                "bvid": "BV0000000022",
+                "title": "【MMD】世界第一公主殿下 初音未来",
+                "tags": ["初音未来", "VOCALOID"],
+                "duration": 250,
+            },
+            {
+                "bvid": "BV0000000023",
+                "title": "[原版PV]初音未来《世界第一公主殿下 World is Mine》",
+                "author": "ryo",
+                "tags": ["初音未来", "VOCALOID", "原曲"],
+                "duration": 254,
+                "copyright": 1,
+            },
+        ]
+
+        ranked = rank_search_candidates(tracks, "世界第一公主殿下")
+
+        self.assertEqual([item["bvid"] for item in ranked], ["BV0000000023"])
+
+    def test_moon_original_wins_across_request_aliases(self):
+        tracks = [
+            {
+                "bvid": "BV0000000024",
+                "title": "❤想听你说月色真美❤",
+                "tags": ["碧蓝档案", "日语学习"],
+                "duration": 34,
+                "play": 2_000_000,
+            },
+            {
+                "bvid": "BV0000000025",
+                "title": "【本家】月が綺麗ねと言われたい！ - 初音ミク【カササギ】",
+                "author": "カササギ_柿崎ユウタ",
+                "tags": ["VOCALOID", "初音ミク", "我想被你说一句月色真美啊"],
+                "duration": 147,
+                "play": 11_000_000,
+                "copyright": 1,
+            },
+        ]
+        aliases = derive_request_query_variants("想听你说月色真美")
+
+        ranked = rank_search_candidates(
+            tracks,
+            "想听你说月色真美",
+            query_variants=aliases,
+        )
+
+        self.assertEqual([item["bvid"] for item in ranked], ["BV0000000025"])
 
     def test_deduplicates_candidates(self):
         track = {

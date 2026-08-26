@@ -29,6 +29,7 @@ try:
     from .search_logic import (
         assess_candidate,
         derive_query_variants,
+        derive_request_query_variants,
         normalize_search_text,
         parse_duration,
         rank_search_candidates,
@@ -37,6 +38,7 @@ except ImportError:  # 允许在仓库根目录直接运行测试和诊断脚本
     from search_logic import (
         assess_candidate,
         derive_query_variants,
+        derive_request_query_variants,
         normalize_search_text,
         parse_duration,
         rank_search_candidates,
@@ -577,11 +579,23 @@ class BiliMediaService:
         )
         return merged
 
-    def _score_candidate(self, track: dict[str, Any], query: str) -> int:
-        return assess_candidate(track, query).score
+    def _score_candidate(
+        self,
+        track: dict[str, Any],
+        query: str,
+        query_variants: list[str] | None = None,
+    ) -> int:
+        return assess_candidate(
+            track,
+            query,
+            query_variants=query_variants,
+        ).score
 
     async def rank_candidates(
-        self, tracks: list[dict[str, Any]], query: str
+        self,
+        tracks: list[dict[str, Any]],
+        query: str,
+        query_variants: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         semaphore = asyncio.Semaphore(4)
         detail_count = min(
@@ -606,7 +620,14 @@ class BiliMediaService:
         detail_indexes = sorted(
             range(len(tracks)),
             key=lambda index: (
-                assess_candidate(tracks[index], query, position=index).score,
+                assess_candidate(
+                    tracks[index],
+                    query,
+                    position=int(
+                        tracks[index].get("best_search_position", index)
+                    ),
+                    query_variants=query_variants,
+                ).score,
                 -index,
             ),
             reverse=True,
@@ -620,9 +641,19 @@ class BiliMediaService:
         minimum_score = _bounded_int(
             self.bili_config.get("search_min_score"), 90, 0, 300
         )
-        ranked = rank_search_candidates(enriched, query, minimum_score=minimum_score)
+        ranked = rank_search_candidates(
+            enriched,
+            query,
+            minimum_score=minimum_score,
+            query_variants=query_variants,
+        )
         for track in enriched:
-            assessment = assess_candidate(track, query)
+            assessment = assess_candidate(
+                track,
+                query,
+                position=int(track.get("best_search_position", 0)),
+                query_variants=query_variants,
+            )
             logger.debug(
                 "[jrsq] 候选评分 %s %s: %s (%s%s)",
                 track.get("bvid"),
@@ -636,7 +667,7 @@ class BiliMediaService:
         return ranked
 
     async def find_candidates(self, query: str) -> list[dict[str, Any]]:
-        """Search exact terms first, then cautiously derive a canonical title."""
+        """Collect several bounded searches, then rank their combined evidence."""
 
         query = " ".join(str(query).split()).strip()
         if not query:
@@ -658,37 +689,79 @@ class BiliMediaService:
             track["search_match"] = "bvid"
             return [track]
 
-        variants = [query]
+        query_aliases = derive_request_query_variants(query)
         suffix = " ".join(
             str(self.bili_config.get("search_suffix") or "").split()
         ).strip()
-        if suffix and normalize_search_text(suffix) not in normalize_search_text(query):
-            variants.append(f"{query} {suffix}")
+        search_variants: list[str] = []
+        variant_seen: set[str] = set()
+
+        def add_search_variant(value: str) -> None:
+            normalized = normalize_search_text(value)
+            if normalized and normalized not in variant_seen:
+                variant_seen.add(normalized)
+                search_variants.append(value)
+
+        for alias in query_aliases:
+            add_search_variant(alias)
+            if suffix and normalize_search_text(suffix) not in normalize_search_text(alias):
+                add_search_variant(f"{alias} {suffix}")
 
         collected: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        collected_indexes: dict[str, int] = {}
         errors: list[str] = []
-        fuzzy_fallback: list[dict[str, Any]] = []
-        for variant in variants:
+
+        def merge_tracks(tracks: list[dict[str, Any]], variant: str) -> None:
+            for position, source_track in enumerate(tracks):
+                track = dict(source_track)
+                identity = str(
+                    track.get("bvid") or track.get("url") or f"{variant}:{position}"
+                ).strip()
+                existing_index = collected_indexes.get(identity)
+                if existing_index is None:
+                    track["best_search_position"] = position
+                    track["search_variants"] = [variant]
+                    collected_indexes[identity] = len(collected)
+                    collected.append(track)
+                    continue
+                existing = collected[existing_index]
+                existing["best_search_position"] = min(
+                    int(existing.get("best_search_position", position)), position
+                )
+                variants_for_track = list(existing.get("search_variants") or [])
+                if variant not in variants_for_track:
+                    variants_for_track.append(variant)
+                existing["search_variants"] = variants_for_track
+
+        # Do not return after the first exact-looking title.  The original/best
+        # upload often only appears in the broadened query, as with live, MMD,
+        # subtitle and short-video results that copy a song title verbatim.
+        for variant in search_variants:
             try:
                 tracks = await self.search(variant)
             except MediaError as exc:
                 errors.append(f"{variant}: {_error_text(exc)}")
                 continue
-            for track in tracks:
-                bvid = str(track.get("bvid") or "")
-                if bvid and bvid in seen:
-                    continue
-                if bvid:
-                    seen.add(bvid)
-                collected.append(track)
+            merge_tracks(tracks, variant)
+
+        initial_ranked: list[dict[str, Any]] = []
+        if collected:
             try:
-                ranked = await self.rank_candidates(collected, query)
-                if ranked[0].get("search_match") not in {"fuzzy", "metadata"}:
-                    return ranked
-                fuzzy_fallback = ranked
+                initial_ranked = await self.rank_candidates(
+                    collected,
+                    query,
+                    query_variants=query_aliases,
+                )
             except MediaError as exc:
-                errors.append(f"{variant}: {_error_text(exc)}")
+                errors.append(_error_text(exc))
+
+        if initial_ranked:
+            top = initial_ranked[0]
+            if top.get("search_original") and top.get("search_match") not in {
+                "fuzzy",
+                "metadata",
+            }:
+                return initial_ranked
 
         # A remembered Chinese title can differ from the title used by the
         # original upload.  Bilibili's own first results often contain the
@@ -697,28 +770,33 @@ class BiliMediaService:
         derived_variants = derive_query_variants(collected, query)
         for derived in derived_variants:
             logger.info("[jrsq] 根据搜索结果将「%s」扩展为「%s」", query, derived)
-            try:
-                tracks = await self.search(derived)
-            except MediaError as exc:
-                errors.append(f"{derived}: {_error_text(exc)}")
-                continue
-
-            merged: list[dict[str, Any]] = []
-            merged_seen: set[str] = set()
-            for track in [*tracks, *collected]:
-                bvid = str(track.get("bvid") or "")
-                if bvid and bvid in merged_seen:
+            derived_searches = [derived]
+            if suffix and normalize_search_text(suffix) not in normalize_search_text(derived):
+                derived_searches.append(f"{derived} {suffix}")
+            for variant in derived_searches:
+                normalized = normalize_search_text(variant)
+                if normalized in variant_seen:
                     continue
-                if bvid:
-                    merged_seen.add(bvid)
-                merged.append(track)
-            try:
-                return await self.rank_candidates(merged, derived)
-            except MediaError as exc:
-                errors.append(f"{derived}: {_error_text(exc)}")
+                variant_seen.add(normalized)
+                try:
+                    tracks = await self.search(variant)
+                except MediaError as exc:
+                    errors.append(f"{variant}: {_error_text(exc)}")
+                    continue
+                merge_tracks(tracks, variant)
 
-        if fuzzy_fallback:
-            return fuzzy_fallback
+        if collected and derived_variants:
+            try:
+                return await self.rank_candidates(
+                    collected,
+                    query,
+                    query_variants=[*query_aliases, *derived_variants],
+                )
+            except MediaError as exc:
+                errors.append(_error_text(exc))
+
+        if initial_ranked:
+            return initial_ranked
         raise MediaError("；".join(errors[-4:]) or f"没有找到「{query}」")
 
     async def search(self, query: str) -> list[dict[str, Any]]:
