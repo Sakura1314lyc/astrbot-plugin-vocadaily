@@ -300,6 +300,109 @@ class SearchLogicTests(unittest.TestCase):
         )
         self.assertIn("请批准吧灯神先生", variants)
 
+    def test_derived_titles_ignore_reupload_packaging(self):
+        variants = derive_query_variants(
+            [
+                {
+                    "title": "惊喜爱无打码补挡",
+                    "tags": ["VOCALOID", "重音テト"],
+                },
+                {
+                    "title": (
+                        "【官方 MV/中字版】惊喜爱/哦吼爱 オッホ愛"
+                        "（初音ミク 亜北ネル 重音テト）【PPP Sounds】"
+                    ),
+                    "tags": ["VOCALOID", "初音ミク", "重音テト"],
+                },
+            ],
+            "惊喜爱",
+        )
+
+        self.assertFalse(any("无打码" in item or "补挡" in item for item in variants))
+        self.assertTrue(any(item.startswith("哦吼爱") for item in variants))
+        self.assertFalse(any("惊喜爱/哦吼爱" in item for item in variants))
+
+    def test_plain_original_version_claim_is_not_home_upload_evidence(self):
+        assessment = assess_candidate(
+            {
+                "title": "惊喜爱原版，你们是不是也被洗脑了",
+                "tags": ["VOCALOID", "重音テト"],
+                "duration": 156,
+                "copyright": 3,
+            },
+            "惊喜爱",
+        )
+
+        self.assertFalse(assessment.original_signal)
+
+    def test_official_mv_outranks_generic_original_version_claim(self):
+        ranked = rank_search_candidates(
+            [
+                {
+                    "bvid": "BV1BEApzJEWS",
+                    "title": "惊喜爱原版，你们是不是也被惊喜爱洗脑了",
+                    "author": "甜甜的幸福小日记",
+                    "tags": ["VOCALOID", "重音テト"],
+                    "duration": 156,
+                    "play": 2_339,
+                    "copyright": 3,
+                },
+                {
+                    "bvid": "BV1NjDrBnEWc",
+                    "title": (
+                        "【官方 MV/中字版】惊喜爱/哦吼爱 オッホ愛"
+                        "（初音ミク 亜北ネル 重音テト）【PPP Sounds】"
+                    ),
+                    "author": "芜溢-中文翻译",
+                    "tags": ["VOCALOID", "初音ミク", "重音テト", "原创曲"],
+                    "duration": 155,
+                    "play": 30_327,
+                    "favorites": 399,
+                    "copyright": 1,
+                },
+            ],
+            "惊喜爱",
+        )
+
+        self.assertEqual(ranked[0]["bvid"], "BV1NjDrBnEWc")
+        self.assertTrue(ranked[0]["search_original"])
+
+    def test_derived_alias_is_recorded_as_lower_confidence_source(self):
+        ranked = rank_search_candidates(
+            [
+                {
+                    "bvid": "BV0000000030",
+                    "title": "アンノウン・マザーグース / wowaka feat. 初音ミク",
+                    "tags": ["VOCALOID", "初音ミク", "原曲"],
+                    "duration": 269,
+                    "copyright": 1,
+                }
+            ],
+            "鹅妈妈的童谣",
+            derived_query_variants=["アンノウン・マザーグース"],
+        )
+
+        self.assertEqual(ranked[0]["search_match_source"], "derived")
+
+    def test_cross_script_alias_requires_explicit_second_pass_trust(self):
+        tracks = [
+            {
+                "title": "【初音ミク】Unknown Mother-Goose【wowaka】",
+                "tags": ["初音ミク", "VOCALOID"],
+            }
+        ]
+
+        self.assertEqual(
+            derive_query_variants(tracks, "アンノウン・マザーグース"),
+            [],
+        )
+        trusted = derive_query_variants(
+            tracks,
+            "アンノウン・マザーグース",
+            allow_top_cross_script=True,
+        )
+        self.assertIn("Unknown Mother-Goose", trusted)
+
     def test_hand_drawn_derivative_is_rejected(self):
         assessment = assess_candidate(
             {
@@ -360,6 +463,41 @@ class SearchLogicTests(unittest.TestCase):
         )
         self.assertFalse(assessment.song_signal)
         self.assertLess(assessment.score, 90)
+
+    def test_archival_reprint_can_use_preserved_external_source_credit(self):
+        assessment = assess_candidate(
+            {
+                "title": "【初音ミク】Unknown Mother-Goose【wowaka】",
+                "author": "原曲存档号",
+                "description": (
+                    "sm31791630 https://www.youtube.com/watch?v=example\n"
+                    "Produced by wowaka"
+                ),
+                "tags": ["VOCALOID", "初音ミク"],
+                "duration": 286,
+                "copyright": 2,
+            },
+            "Unknown Mother Goose",
+        )
+
+        self.assertTrue(assessment.original_signal)
+        self.assertGreater(assessment.score, 140)
+
+    def test_cover_source_link_is_not_original_evidence(self):
+        assessment = assess_candidate(
+            {
+                "title": "不为人知的鹅妈妈童谣／鏡音レン／キノコP",
+                "description": (
+                    "本家：sm31791630\nMusic：wowaka\nVocal：鏡音レン"
+                ),
+                "tags": ["VOCALOID", "鏡音レン", "wowaka"],
+                "duration": 287,
+                "copyright": 1,
+            },
+            "鹅妈妈的童谣",
+        )
+
+        self.assertFalse(assessment.original_signal)
 
 
 if __name__ == "__main__":

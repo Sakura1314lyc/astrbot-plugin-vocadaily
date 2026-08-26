@@ -354,7 +354,35 @@ _REVIEW_CAUTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "投稿带有成人向或明显性暗示标签，需要提醒内容接受门槛",
-        ("r18", "r-18", "成人向", "nsfw", "色情", "性暗示"),
+        (
+            "r18",
+            "r-18",
+            "成人向",
+            "nsfw",
+            "色情",
+            "性暗示",
+            "自慰",
+            "娇喘",
+            "嬌喘",
+        ),
+    ),
+)
+
+# A few well-known title aliases carry themes that Bilibili tags often omit.
+# They add context to the review but never block playback.
+_KNOWN_REVIEW_CAUTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "作品以明显的性暗示、喘息拟声或挑逗表达为核心，不能包装成单纯元气可爱",
+        (
+            "威风堂堂",
+            "威風堂々",
+            "オッホ愛",
+            "哦吼爱",
+            "惊喜爱",
+            "驚喜愛",
+            "ラビットホール",
+            "rabbit hole",
+        ),
     ),
 )
 
@@ -367,6 +395,7 @@ _REVIEW_CAUTION_ACK_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("自伤", ("自伤", "自残", "自杀", "死亡", "心理困扰", "压抑")),
     ("争议", ("争议", "炎上")),
     ("成人向", ("成人向", "性暗示", "内容门槛", "不适")),
+    ("性暗示", ("性暗示", "喘息", "挑逗", "露骨", "成人向", "不适")),
     ("不足 50 秒", ("不足", "过短", "片段", "完整作品")),
     ("超过 15 分钟", ("超过", "过长", "合集", "循环", "单曲本体")),
     ("不确定性", ("不确定", "信息不足", "作品身份", "模糊匹配", "元数据")),
@@ -394,6 +423,10 @@ def _derive_review_cautions(track: dict[str, Any]) -> list[str]:
         for label, markers in _REVIEW_CAUTION_GROUPS
         if any(_review_marker_present(evidence, marker) for marker in markers)
     ]
+    title_norm = normalize_search_text(title)
+    for label, aliases in _KNOWN_REVIEW_CAUTIONS:
+        if any(normalize_search_text(alias) in title_norm for alias in aliases):
+            cautions.append(label)
 
     duration = parse_duration(track.get("duration"))
     if 0 < duration < 50:
@@ -405,7 +438,9 @@ def _derive_review_cautions(track: dict[str, Any]) -> list[str]:
     score = _bounded_int(track.get("search_score"), 0, 0, 999)
     if match_quality in {"fuzzy", "metadata"} and score < 140:
         cautions.append("曲名主要靠模糊或元数据匹配，作品身份仍有不确定性")
-    return cautions[:5]
+    if str(track.get("search_match_source") or "") == "derived" and score < 170:
+        cautions.append("曲名经过搜索结果推导才匹配，作品身份需要保留不确定性")
+    return list(dict.fromkeys(cautions))[:5]
 
 
 def _review_acknowledges_caution(review: str, cautions: list[str]) -> bool:
@@ -723,11 +758,13 @@ class BiliMediaService:
         track: dict[str, Any],
         query: str,
         query_variants: list[str] | None = None,
+        derived_query_variants: list[str] | None = None,
     ) -> int:
         return assess_candidate(
             track,
             query,
             query_variants=query_variants,
+            derived_query_variants=derived_query_variants,
         ).score
 
     async def rank_candidates(
@@ -735,6 +772,7 @@ class BiliMediaService:
         tracks: list[dict[str, Any]],
         query: str,
         query_variants: list[str] | None = None,
+        derived_query_variants: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         semaphore = asyncio.Semaphore(4)
         detail_count = min(
@@ -756,7 +794,7 @@ class BiliMediaService:
         # first N items can starve its best result of details.  Prioritize the
         # strongest raw title matches across all batches, then restore the
         # original order so Bilibili's search position remains a tie-breaker.
-        detail_indexes = sorted(
+        raw_detail_order = sorted(
             range(len(tracks)),
             key=lambda index: (
                 assess_candidate(
@@ -766,11 +804,33 @@ class BiliMediaService:
                         tracks[index].get("best_search_position", index)
                     ),
                     query_variants=query_variants,
+                    derived_query_variants=derived_query_variants,
                 ).score,
                 -index,
             ),
             reverse=True,
-        )[:detail_count]
+        )
+        refined_reserves = sorted(
+            (
+                index
+                for index, track in enumerate(tracks)
+                if int(track.get("best_search_position", index)) <= 2
+                and any(
+                    str(origin).startswith("refined:")
+                    for origin in track.get("search_origins") or []
+                )
+            ),
+            key=lambda index: int(
+                tracks[index].get("best_search_position", index)
+            ),
+        )[: max(1, min(4, detail_count // 2))]
+        detail_indexes = list(refined_reserves)
+        detail_indexes.extend(
+            index
+            for index in raw_detail_order
+            if index not in detail_indexes
+        )
+        detail_indexes = detail_indexes[:detail_count]
         detail_results = await asyncio.gather(
             *(enrich_limited(tracks[index]) for index in detail_indexes),
         )
@@ -785,6 +845,7 @@ class BiliMediaService:
             query,
             minimum_score=minimum_score,
             query_variants=query_variants,
+            derived_query_variants=derived_query_variants,
         )
         for track in enriched:
             assessment = assess_candidate(
@@ -792,6 +853,7 @@ class BiliMediaService:
                 query,
                 position=int(track.get("best_search_position", 0)),
                 query_variants=query_variants,
+                derived_query_variants=derived_query_variants,
             )
             logger.debug(
                 "[jrsq] 候选评分 %s %s: %s (%s%s)",
@@ -832,25 +894,28 @@ class BiliMediaService:
         suffix = " ".join(
             str(self.bili_config.get("search_suffix") or "").split()
         ).strip()
-        search_variants: list[str] = []
+        search_variants: list[tuple[str, str]] = []
         variant_seen: set[str] = set()
 
-        def add_search_variant(value: str) -> None:
+        def add_search_variant(value: str, origin: str) -> None:
             normalized = normalize_search_text(value)
             if normalized and normalized not in variant_seen:
                 variant_seen.add(normalized)
-                search_variants.append(value)
+                search_variants.append((value, origin))
 
         for alias in query_aliases:
-            add_search_variant(alias)
+            origin = f"request:{normalize_search_text(alias)}"
+            add_search_variant(alias, origin)
             if suffix and normalize_search_text(suffix) not in normalize_search_text(alias):
-                add_search_variant(f"{alias} {suffix}")
+                add_search_variant(f"{alias} {suffix}", origin)
 
         collected: list[dict[str, Any]] = []
         collected_indexes: dict[str, int] = {}
         errors: list[str] = []
 
-        def merge_tracks(tracks: list[dict[str, Any]], variant: str) -> None:
+        def merge_tracks(
+            tracks: list[dict[str, Any]], variant: str, origin: str
+        ) -> None:
             for position, source_track in enumerate(tracks):
                 track = dict(source_track)
                 identity = str(
@@ -860,6 +925,7 @@ class BiliMediaService:
                 if existing_index is None:
                     track["best_search_position"] = position
                     track["search_variants"] = [variant]
+                    track["search_origins"] = [origin]
                     collected_indexes[identity] = len(collected)
                     collected.append(track)
                     continue
@@ -871,17 +937,30 @@ class BiliMediaService:
                 if variant not in variants_for_track:
                     variants_for_track.append(variant)
                 existing["search_variants"] = variants_for_track
+                origins_for_track = list(existing.get("search_origins") or [])
+                if origin not in origins_for_track:
+                    origins_for_track.append(origin)
+                existing["search_origins"] = origins_for_track
+                # Search backends expose different fields. Preserve the richest
+                # copy instead of freezing whatever the first backend returned.
+                for key in ("title", "author", "duration", "description", "category", "tags"):
+                    if not existing.get(key) and track.get(key):
+                        existing[key] = track[key]
+                for key in ("play", "favorites"):
+                    existing[key] = max(
+                        int(existing.get(key) or 0), int(track.get(key) or 0)
+                    )
 
         # Do not return after the first exact-looking title.  The original/best
         # upload often only appears in the broadened query, as with live, MMD,
         # subtitle and short-video results that copy a song title verbatim.
-        for variant in search_variants:
+        for variant, origin in search_variants:
             try:
                 tracks = await self.search(variant)
             except MediaError as exc:
                 errors.append(f"{variant}: {_error_text(exc)}")
                 continue
-            merge_tracks(tracks, variant)
+            merge_tracks(tracks, variant, origin)
 
         initial_ranked: list[dict[str, Any]] = []
         if collected:
@@ -907,9 +986,11 @@ class BiliMediaService:
         # canonical title in quotes, so use that for one bounded second pass.
         # This deliberately avoids asking an LLM to invent song aliases.
         derived_variants = derive_query_variants(collected, query)
+        second_pass_tracks: list[dict[str, Any]] = []
         for derived in derived_variants:
             logger.info("[jrsq] 根据搜索结果将「%s」扩展为「%s」", query, derived)
             derived_searches = [derived]
+            derived_origin = f"derived:{normalize_search_text(derived)}"
             if suffix and normalize_search_text(suffix) not in normalize_search_text(derived):
                 derived_searches.append(f"{derived} {suffix}")
             for variant in derived_searches:
@@ -922,14 +1003,62 @@ class BiliMediaService:
                 except MediaError as exc:
                     errors.append(f"{variant}: {_error_text(exc)}")
                     continue
-                merge_tracks(tracks, variant)
+                second_pass_tracks.extend(tracks)
+                merge_tracks(tracks, variant, derived_origin)
+
+        # A bilingual result may reveal one more canonical spelling only after
+        # the first alias search (for example Japanese -> English). Allow one
+        # small extra hop, but never recurse or exceed two extra probes.
+        refined_variants: list[str] = []
+        refined_seen: set[str] = set()
+        for seed in derived_variants:
+            for value in derive_query_variants(
+                second_pass_tracks,
+                seed,
+                limit=2,
+                allow_top_cross_script=True,
+            ):
+                normalized = normalize_search_text(value)
+                if normalized and normalized not in refined_seen:
+                    refined_seen.add(normalized)
+                    refined_variants.append(value)
+                if len(refined_variants) >= 2:
+                    break
+            if len(refined_variants) >= 2:
+                break
+        derived_norms = {
+            normalize_search_text(value) for value in derived_variants
+        }
+        for refined in refined_variants:
+            normalized = normalize_search_text(refined)
+            if normalized in derived_norms or normalized in variant_seen:
+                continue
+            derived_norms.add(normalized)
+            variant_seen.add(normalized)
+            derived_variants.append(refined)
+            logger.info(
+                "[jrsq] 根据双语结果将「%s」进一步扩展为「%s」",
+                query,
+                refined,
+            )
+            try:
+                tracks = await self.search(refined)
+            except MediaError as exc:
+                errors.append(f"{refined}: {_error_text(exc)}")
+                continue
+            merge_tracks(
+                tracks,
+                refined,
+                f"refined:{normalized}",
+            )
 
         if collected and derived_variants:
             try:
                 return await self.rank_candidates(
                     collected,
                     query,
-                    query_variants=[*query_aliases, *derived_variants],
+                    query_variants=query_aliases,
+                    derived_query_variants=derived_variants,
                 )
             except MediaError as exc:
                 errors.append(_error_text(exc))
@@ -1932,6 +2061,7 @@ class JRSQPlugin(Star):
             "标签": [str(tag)[:40] for tag in (track.get("tags") or [])[:8]],
             "简介": " ".join(str(track.get("description") or "").split())[:300],
             "检索匹配方式": str(track.get("search_match") or "未知")[:30],
+            "检索匹配来源": str(track.get("search_match_source") or "用户曲名")[:30],
             "检索评分": track.get("search_score"),
             "是否有本家或官方证据": bool(track.get("search_original")),
         }

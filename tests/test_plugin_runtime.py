@@ -35,6 +35,54 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("不足 50 秒" in item for item in cautions))
         self.assertTrue(any("不确定性" in item for item in cautions))
 
+    def test_review_cautions_recognize_known_sexual_theme_titles(self):
+        for title in (
+            "【原版】威風堂々",
+            "【官方 MV/中字版】惊喜爱/哦吼爱 オッホ愛",
+        ):
+            with self.subTest(title=title):
+                cautions = main._derive_review_cautions(
+                    {
+                        "title": title,
+                        "tags": ["VOCALOID"],
+                        "duration": 180,
+                        "search_match": "title",
+                        "search_score": 190,
+                    }
+                )
+                self.assertTrue(any("性暗示" in item for item in cautions))
+
+    async def test_known_sensitive_song_review_cannot_stay_generic_positive(self):
+        provider = SimpleNamespace(
+            text_chat=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(
+                        completion_text="节奏充满活力，华丽电子编曲特别抓耳，值得循环。"
+                    ),
+                    SimpleNamespace(
+                        completion_text="编曲确实抓耳，但作品用喘息与性暗示制造刺激，不能只当元气舞曲来夸。"
+                    ),
+                ]
+            )
+        )
+        plugin = object.__new__(main.JRSQPlugin)
+        plugin.review_config = {"enabled": True, "max_chars": 100}
+        plugin.context = SimpleNamespace(get_using_provider=lambda _origin: provider)
+
+        review = await plugin._generate_review(
+            SimpleNamespace(unified_msg_origin="group:test"),
+            "威风堂堂",
+            {
+                "title": "【原版】威風堂々",
+                "tags": ["VOCALOID"],
+                "duration": 213,
+            },
+            "B站",
+        )
+
+        self.assertIn("性暗示", review)
+        self.assertEqual(provider.text_chat.await_count, 2)
+
     async def test_problematic_review_is_retried_when_model_only_praises(self):
         provider = SimpleNamespace(
             text_chat=AsyncMock(
@@ -315,6 +363,56 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tracks[0]["bvid"], "BV0000000019")
 
+    async def test_bilingual_result_allows_one_bounded_alias_hop(self):
+        service = main.BiliMediaService(
+            {"search_suffix": "", "search_min_score": 90}, {}
+        )
+        translated = [
+            {
+                "bvid": "BV0000000031",
+                "title": "アンノウン・マザーグース / 不为人知的鹅妈妈童谣",
+                "tags": ["初音ミク", "VOCALOID"],
+                "duration": 269,
+            }
+        ]
+        bilingual = [
+            {
+                "bvid": "BV0000000032",
+                "title": "アンノウン・マザーグース / Unknown Mother Goose",
+                "tags": ["初音ミク", "VOCALOID"],
+                "duration": 269,
+            }
+        ]
+        original = [
+            {
+                "bvid": "BV0000000033",
+                "title": "【本家】Unknown Mother-Goose【wowaka feat. 初音ミク】",
+                "tags": ["初音ミク", "VOCALOID", "原曲"],
+                "duration": 269,
+                "copyright": 1,
+            }
+        ]
+
+        async def fake_search(query):
+            if query.startswith("Unknown Mother"):
+                return original
+            if query.startswith("アンノウン"):
+                return bilingual
+            return translated
+
+        service.search = AsyncMock(side_effect=fake_search)
+        service.enrich = AsyncMock(side_effect=lambda track: track)
+
+        tracks = await service.find_candidates("鹅妈妈的童谣")
+
+        self.assertEqual(tracks[0]["bvid"], "BV0000000033")
+        self.assertTrue(
+            any(
+                call.args[0].startswith("Unknown Mother")
+                for call in service.search.await_args_list
+            )
+        )
+
     async def test_ranking_enriches_best_candidate_beyond_first_batch(self):
         service = main.BiliMediaService(
             {"detail_count": 1, "search_min_score": 90}, {}
@@ -338,6 +436,49 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ranked[0]["bvid"], "BV0000000011")
         self.assertEqual(service.enrich.await_args.args[0]["bvid"], "BV0000000011")
+
+    async def test_ranking_reserves_detail_slot_for_refined_alias(self):
+        service = main.BiliMediaService(
+            {"detail_count": 1, "search_min_score": 90}, {}
+        )
+        tracks = [
+            {
+                "bvid": "BV0000000034",
+                "title": "鹅妈妈的童谣热门字幕版",
+                "tags": ["初音ミク", "VOCALOID"],
+                "duration": 269,
+                "best_search_position": 0,
+                "search_origins": ["request:鹅妈妈的童谣"],
+            },
+            {
+                "bvid": "BV0000000035",
+                "title": "【初音ミク】Unknown Mother-Goose【wowaka】",
+                "tags": ["初音ミク", "VOCALOID"],
+                "duration": 269,
+                "best_search_position": 0,
+                "search_origins": ["refined:unknownmothergoose"],
+            },
+        ]
+
+        async def enrich(track):
+            if track["bvid"] == "BV0000000035":
+                return {
+                    **track,
+                    "description": "Produced by wowaka",
+                    "copyright": 2,
+                }
+            return track
+
+        service.enrich = AsyncMock(side_effect=enrich)
+
+        ranked = await service.rank_candidates(
+            tracks,
+            "鹅妈妈的童谣",
+            derived_query_variants=["Unknown Mother Goose"],
+        )
+
+        self.assertEqual(service.enrich.await_args.args[0]["bvid"], "BV0000000035")
+        self.assertEqual(ranked[0]["bvid"], "BV0000000035")
 
     async def test_internal_media_server_serves_cache_file(self):
         with socket.socket() as sock:

@@ -149,6 +149,14 @@ HARD_NEGATIVE_MARKERS = (
     "一小時循環",
     "循环播放",
     "循環播放",
+    "无打码",
+    "無打碼",
+    "无码",
+    "無碼",
+    "补档",
+    "補檔",
+    "补挡",
+    "補擋",
 )
 
 SOFT_NEGATIVE_MARKERS = (
@@ -170,6 +178,16 @@ SOFT_NEGATIVE_MARKERS = (
     "中文字幕",
     "字幕版",
     "中字",
+    "自制字幕",
+    "自製字幕",
+    "自制中文字幕",
+    "自製中文字幕",
+    "高精度还原",
+    "高精度還原",
+    "声库对比",
+    "聲庫對比",
+    "修正版对比",
+    "修正版對比",
     "修复",
     "修復",
     "高质量",
@@ -221,6 +239,9 @@ VOCAL_SYNTH_MARKERS = (
 
 ORIGINAL_MARKERS = (
     "official",
+    "官方投稿",
+    "官方mv",
+    "官方pv",
     "本家",
     "原曲",
     "原版",
@@ -234,14 +255,56 @@ ORIGINAL_MARKERS = (
 STRONG_ORIGINAL_MARKERS = (
     "本家投稿",
     "本家",
+    "官方投稿",
+    "官方mv",
+    "官方pv",
     "原曲",
     "原版pv",
-    "原版",
     "原创曲",
     "原創曲",
     "オリジナル",
     "official",
     "original",
+)
+
+LIGHT_SOFT_NEGATIVE_MARKERS = (
+    "完整版",
+    "中文字幕",
+    "字幕版",
+    "中字",
+)
+
+EDITORIAL_TITLE_MARKERS = (
+    "你们",
+    "你們",
+    "是不是",
+    "有没有",
+    "有沒有",
+    "竟然",
+    "居然",
+    "听完",
+    "聽完",
+    "看完",
+    "什么水平",
+    "什麼水平",
+    "如何评价",
+    "如何評價",
+    "洗脑了",
+    "洗腦了",
+)
+
+_DERIVED_TITLE_REJECT_MARKERS = (
+    *HARD_NEGATIVE_MARKERS,
+    "无打码",
+    "無打碼",
+    "无码",
+    "無碼",
+    "补档",
+    "補檔",
+    "补挡",
+    "補擋",
+    "未删减",
+    "未刪減",
 )
 
 
@@ -283,6 +346,21 @@ def _marker_present(text: str, marker: str) -> bool:
 
 def _find_markers(text: str, markers: Iterable[str]) -> tuple[str, ...]:
     return tuple(marker for marker in markers if _marker_present(text, marker))
+
+
+def _distinct_marker_count(markers: Iterable[str]) -> int:
+    """Count overlapping labels once (for example, 中文字幕 and 中字)."""
+
+    selected: list[str] = []
+    normalized = sorted(
+        {normalize_search_text(marker) for marker in markers if marker},
+        key=len,
+        reverse=True,
+    )
+    for marker in normalized:
+        if marker and not any(marker in existing for existing in selected):
+            selected.append(marker)
+    return len(selected)
 
 
 _BRACKETED_PREFIX_RE = re.compile(
@@ -403,7 +481,11 @@ def derive_request_query_variants(query: str, *, limit: int = 5) -> list[str]:
 
 
 def derive_query_variants(
-    tracks: Iterable[dict[str, Any]], query: str, *, limit: int = 3
+    tracks: Iterable[dict[str, Any]],
+    query: str,
+    *,
+    limit: int = 3,
+    allow_top_cross_script: bool = False,
 ) -> list[str]:
     """Derive likely canonical titles from strong top search results.
 
@@ -431,6 +513,16 @@ def derive_query_variants(
             or _find_markers(metadata, ORIGINAL_MARKERS)
         ):
             continue
+        title_norm = normalize_search_text(title)
+        source_relevant = (
+            query_norm in title_norm
+            or _best_title_similarity(title, query) >= 0.44
+        )
+        if not source_relevant and not (
+            allow_top_cross_script and position <= 2
+        ):
+            # Do not let an unrelated top search result invent a new song name.
+            continue
 
         quoted = [
             match.group("title").strip()
@@ -439,8 +531,13 @@ def derive_query_variants(
         stripped = _BRACKETED_PREFIX_RE.sub(" ", title).strip()
         pieces = [*quoted]
         if stripped:
-            pieces.extend(_TITLE_SEPARATOR_RE.split(stripped))
-            pieces.append(stripped)
+            split_pieces = _TITLE_SEPARATOR_RE.split(stripped)
+            pieces.extend(split_pieces)
+            # A whole "title / singer" string is a poor second-pass query and
+            # can overpower the user's title. Keep it only when no separator
+            # was found.
+            if len(split_pieces) == 1:
+                pieces.append(stripped)
 
         for piece in pieces:
             piece = piece.strip(" \t\r\n-—–:：,，!！?？'\"")
@@ -449,8 +546,19 @@ def derive_query_variants(
                 continue
             if normalized in seen or normalized in singer_names:
                 continue
-            if _find_markers(piece, HARD_NEGATIVE_MARKERS):
+            if _find_markers(piece, _DERIVED_TITLE_REJECT_MARKERS):
                 continue
+            if re.search(r"(?i)(?:^|\s)(?:feat\.?|ft\.?|vocal(?:s)?|music|movie|mix)\b", piece):
+                continue
+            singer_hits = _find_markers(piece, VOCAL_SYNTH_MARKERS)
+            if singer_hits:
+                credit_residue = normalized
+                for hit in singer_hits:
+                    credit_residue = credit_residue.replace(
+                        normalize_search_text(hit), ""
+                    )
+                if len(credit_residue) <= 2:
+                    continue
             seen.add(normalized)
             variants.append(piece)
             if len(variants) >= limit:
@@ -466,6 +574,7 @@ class CandidateAssessment:
     song_signal: bool
     rejected_reason: str | None = None
     original_signal: bool = False
+    match_source: str = "request"
 
 
 def assess_candidate(
@@ -474,6 +583,7 @@ def assess_candidate(
     *,
     position: int = 0,
     query_variants: Iterable[str] | None = None,
+    derived_query_variants: Iterable[str] | None = None,
 ) -> CandidateAssessment:
     """Score a candidate while keeping exclusion reasons observable."""
 
@@ -483,14 +593,18 @@ def assess_candidate(
     description = str(track.get("description") or "")
     category = str(track.get("category") or "")
     title_norm = normalize_search_text(title)
-    query_pairs: list[tuple[str, str]] = []
+    query_pairs: list[tuple[str, str, str, int]] = []
     query_seen: set[str] = set()
-    for value in [query, *(query_variants or [])]:
-        normalized = normalize_search_text(value)
-        if normalized and normalized not in query_seen:
-            query_seen.add(normalized)
-            query_pairs.append((str(value), normalized))
-    query_values = [normalized for _, normalized in query_pairs]
+    for source, penalty, values in (
+        ("request", 0, [query, *(query_variants or [])]),
+        ("derived", 22, list(derived_query_variants or [])),
+    ):
+        for value in values:
+            normalized = normalize_search_text(value)
+            if normalized and normalized not in query_seen:
+                query_seen.add(normalized)
+                query_pairs.append((str(value), normalized, source, penalty))
+    query_values = [normalized for _, normalized, _, _ in query_pairs]
     query_norm = query_values[0] if query_values else ""
     metadata = f"{title} {author} {tags} {description} {category}"
     metadata_norm = normalize_search_text(metadata)
@@ -517,21 +631,25 @@ def assess_candidate(
             f"标签含排除词：{tagged_negatives[0]}",
         )
 
-    match_candidates: list[tuple[int, str]] = []
-    for value, normalized in query_pairs:
+    match_candidates: list[tuple[int, str, str]] = []
+    for value, normalized, source, penalty in query_pairs:
         if title_norm == normalized:
-            match_candidates.append((150, "exact"))
+            match_candidates.append((150 - penalty, "exact", source))
         elif title_norm.startswith(normalized):
-            match_candidates.append((128, "prefix"))
+            match_candidates.append((128 - penalty, "prefix", source))
         elif normalized in title_norm:
-            match_candidates.append((105, "title"))
+            match_candidates.append((105 - penalty, "title", source))
         elif _best_title_similarity(title, value) >= 0.62:
-            match_candidates.append((90, "fuzzy"))
+            match_candidates.append((90 - penalty, "fuzzy", source))
         elif normalized in metadata_norm:
-            match_candidates.append((35, "metadata"))
+            match_candidates.append((35 - penalty, "metadata", source))
         else:
-            match_candidates.append((-70, "none"))
-    score, match_quality = max(match_candidates, default=(-70, "none"))
+            match_candidates.append((-70, "none", source))
+    score, match_quality, match_source = max(
+        match_candidates,
+        key=lambda item: (item[0], item[2] == "request"),
+        default=(-70, "none", "request"),
+    )
 
     signal_context = f"{title} {author} {tags} {category}"
     vocal_title = bool(_find_markers(f"{title} {tags}", VOCAL_SYNTH_MARKERS))
@@ -547,8 +665,23 @@ def assess_candidate(
         _find_markers(f"{author} {tags} {category}", ("本家投稿", "本家"))
     )
     official_author = _marker_present(author, "official") or "官方" in author
+    producer_credits = re.findall(
+        r"(?im)^(?:produced\s+by|music(?:\s*&\s*lyrics)?\s*[:：])\s*"
+        r"([^\n/|]{2,50})",
+        unicodedata.normalize("NFKC", description),
+    )
+    external_source_credit = vocal_title and any(
+        normalize_search_text(credit) in title_norm
+        for credit in producer_credits
+        if normalize_search_text(credit)
+    )
     song_signal = vocal_metadata or original_metadata or official_author
-    original_signal = strong_original_title or strong_original_metadata or official_author
+    original_signal = (
+        strong_original_title
+        or strong_original_metadata
+        or official_author
+        or external_source_credit
+    )
 
     if _marker_present(title, "ai") and not strong_original_title:
         return CandidateAssessment(
@@ -558,6 +691,7 @@ def assess_candidate(
             song_signal=song_signal,
             rejected_reason="标题标注 AI 版本",
             original_signal=False,
+            match_source=match_source,
         )
 
     if vocal_title:
@@ -569,7 +703,12 @@ def assess_candidate(
     elif strong_original_title:
         score += 56
     elif original_title:
-        score += 34
+        # "原版" and "feat" are easy for repost titles to claim. They help,
+        # but are not proof of a home/official upload on their own.
+        score += 12
+        copyright_value = _safe_int(track.get("copyright"))
+        if copyright_value not in {0, 1}:
+            score -= 24
     elif home_upload_metadata:
         score += 44
     elif strong_original_metadata:
@@ -578,6 +717,10 @@ def assess_candidate(
         score += 12
     if official_author:
         score += 16
+    if external_source_credit:
+        # Old Bilibili reprints of the Niconico/YouTube original often have no
+        # "原曲" tag, but preserve the source ID and producer credits.
+        score += 40
     if _safe_int(track.get("copyright")) == 1:
         score += 10
     if not song_signal:
@@ -587,8 +730,17 @@ def assess_candidate(
         # 仅给搜索页最前面的强术曲信号结果加权，避免普通视频借简介蹭分。
         score += 25
 
-    soft_title = _find_markers(title, SOFT_NEGATIVE_MARKERS)
-    score -= min(60, 24 * len(soft_title))
+    light_soft = _find_markers(title, LIGHT_SOFT_NEGATIVE_MARKERS)
+    light_norms = {normalize_search_text(marker) for marker in light_soft}
+    heavy_soft = tuple(
+        marker
+        for marker in _find_markers(title, SOFT_NEGATIVE_MARKERS)
+        if normalize_search_text(marker) not in light_norms
+    )
+    score -= min(54, 18 * _distinct_marker_count(heavy_soft))
+    score -= min(12, 6 * _distinct_marker_count(light_soft))
+    editorial_markers = _find_markers(title, EDITORIAL_TITLE_MARKERS)
+    score -= min(42, 14 * _distinct_marker_count(editorial_markers))
     if _find_markers(f"{description} {tags}", HARD_NEGATIVE_MARKERS):
         score -= 8
 
@@ -616,6 +768,15 @@ def assess_candidate(
     if favorites:
         score += min(6, int(math.log10(favorites + 1)))
     score += max(0, 8 - min(max(0, position), 8))
+    origin_count = len(
+        {
+            normalize_search_text(origin)
+            for origin in track.get("search_origins") or []
+            if normalize_search_text(origin)
+        }
+    )
+    if origin_count > 1:
+        score += min(12, 4 * (origin_count - 1))
 
     return CandidateAssessment(
         score=score,
@@ -623,6 +784,7 @@ def assess_candidate(
         title_match=match_quality in {"exact", "prefix", "title", "fuzzy"},
         song_signal=song_signal,
         original_signal=original_signal,
+        match_source=match_source,
     )
 
 
@@ -632,6 +794,7 @@ def rank_search_candidates(
     *,
     minimum_score: int = 90,
     query_variants: Iterable[str] | None = None,
+    derived_query_variants: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return safe, relevant candidates sorted by confidence."""
 
@@ -652,10 +815,12 @@ def rank_search_candidates(
             query,
             position=effective_position,
             query_variants=query_variants,
+            derived_query_variants=derived_query_variants,
         )
         track["search_score"] = assessment.score
         track["search_match"] = assessment.match_quality
         track["search_original"] = assessment.original_signal
+        track["search_match_source"] = assessment.match_source
         if assessment.rejected_reason:
             track["search_rejected_reason"] = assessment.rejected_reason
             continue
@@ -671,8 +836,8 @@ def rank_search_candidates(
 
     ranked.sort(
         key=lambda item: (
-            int(item.get("search_score") or 0),
             bool(item.get("search_original")),
+            int(item.get("search_score") or 0),
             _safe_int(item.get("favorites")),
             _safe_int(item.get("play")),
         ),
