@@ -3,6 +3,7 @@ import socket
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
@@ -18,6 +19,82 @@ finally:
 
 
 class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_review_cautions_detect_version_content_and_short_clip(self):
+        cautions = main._derive_review_cautions(
+            {
+                "title": "【AI翻唱／猎奇慎入】测试曲",
+                "tags": ["cover", "恐怖", "血腥"],
+                "duration": 34,
+                "search_match": "metadata",
+                "search_score": 110,
+            }
+        )
+
+        self.assertTrue(any("翻唱" in item for item in cautions))
+        self.assertTrue(any("不适" in item for item in cautions))
+        self.assertTrue(any("不足 50 秒" in item for item in cautions))
+        self.assertTrue(any("不确定性" in item for item in cautions))
+
+    async def test_problematic_review_is_retried_when_model_only_praises(self):
+        provider = SimpleNamespace(
+            text_chat=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(completion_text="旋律甜美可爱，听完心情都会变好。"),
+                    SimpleNamespace(
+                        completion_text="这是翻唱版本，调声显得生硬，不能替代原曲本家的表达。"
+                    ),
+                ]
+            )
+        )
+        plugin = object.__new__(main.JRSQPlugin)
+        plugin.review_config = {"enabled": True, "max_chars": 100}
+        plugin.context = SimpleNamespace(get_using_provider=lambda _origin: provider)
+        event = SimpleNamespace(unified_msg_origin="group:test")
+
+        review = await plugin._generate_review(
+            event,
+            "测试曲",
+            {
+                "title": "【AI翻唱】测试曲",
+                "tags": ["cover"],
+                "duration": 180,
+            },
+            "B站",
+        )
+
+        self.assertIn("翻唱", review)
+        self.assertIn("生硬", review)
+        self.assertEqual(provider.text_chat.await_count, 2)
+        self.assertIn("上一版短评回避了注意项", provider.text_chat.await_args_list[1].kwargs["prompt"])
+
+    async def test_problematic_review_uses_fallback_after_two_evasive_answers(self):
+        provider = SimpleNamespace(
+            text_chat=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(completion_text="真是一首可爱又治愈的作品。"),
+                    SimpleNamespace(completion_text="听起来很甜，特别值得推荐。"),
+                ]
+            )
+        )
+        plugin = object.__new__(main.JRSQPlugin)
+        plugin.review_config = {"enabled": True, "max_chars": 100}
+        plugin.context = SimpleNamespace(get_using_provider=lambda _origin: provider)
+
+        review = await plugin._generate_review(
+            SimpleNamespace(unified_msg_origin="group:test"),
+            "测试曲",
+            {
+                "title": "【猎奇慎入】测试曲",
+                "tags": ["恐怖", "血腥"],
+                "duration": 180,
+            },
+            "B站",
+        )
+
+        self.assertIn("不能只往好处说", review)
+        self.assertIn("不适", review)
+        self.assertEqual(provider.text_chat.await_count, 2)
+
     def test_invalid_config_section_falls_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "plugin_config.json"
