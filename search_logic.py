@@ -368,6 +368,16 @@ _BRACKETED_PREFIX_RE = re.compile(
 )
 _QUOTED_TITLE_RE = re.compile(r"[《「『](?P<title>[^》」』]{2,80})[》」』]")
 _TITLE_SEPARATOR_RE = re.compile(r"\s*(?:/|／|\||｜|—|–)\s*")
+_PAREN_ALIAS_RE = re.compile(r"[（(](?P<title>[^()（）]{2,60})[）)]")
+
+# A small, evidence-backed alias table is safer than asking an LLM to guess a
+# title.  Keep this deliberately narrow: entries belong here only when the
+# Chinese, Japanese and English names are established names of the same song.
+_KNOWN_TITLE_ALIASES = {
+    "角色t": ("キャラクターT", "Character T", "角色T 重音テト Atena"),
+    "キャラクターt": ("角色T", "Character T", "キャラクターT 重音テト Atena"),
+    "charactert": ("角色T", "キャラクターT", "Character T 重音テト Atena"),
+}
 
 
 def _title_match_variants(title: str) -> tuple[str, ...]:
@@ -395,6 +405,23 @@ def _best_title_similarity(title: str, query: str) -> float:
     query_norm = normalize_search_text(query)
     if len(query_norm) < 4:
         return 0.0
+
+    # A trailing one-letter discriminator can be the meaningful part of a
+    # title ("Character T").  Sequence similarity would otherwise consider
+    # plain "Character" almost identical and admit an unrelated song.
+    query_ascii_tokens = re.findall(
+        r"[a-z0-9]+",
+        unicodedata.normalize("NFKC", str(query)).casefold(),
+    )
+    if len(query_ascii_tokens) >= 2 and len(query_ascii_tokens[-1]) == 1:
+        title_ascii_tokens = set(
+            re.findall(
+                r"[a-z0-9]+",
+                unicodedata.normalize("NFKC", str(title)).casefold(),
+            )
+        )
+        if query_ascii_tokens[-1] not in title_ascii_tokens:
+            return 0.0
 
     def ngram_dice(left: str, right: str) -> float:
         size = 2 if min(len(left), len(right)) < 8 else 3
@@ -466,6 +493,11 @@ def derive_request_query_variants(query: str, *, limit: int = 5) -> list[str]:
     if suffix_cleaned and suffix_cleaned != cleaned:
         values.append(suffix_cleaned)
 
+    # Known cross-language names are extra retrieval probes.  The user's text
+    # remains first and therefore keeps the highest ranking authority.
+    for source in tuple(values):
+        values.extend(_KNOWN_TITLE_ALIASES.get(normalize_search_text(source), ()))
+
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -528,8 +560,12 @@ def derive_query_variants(
             match.group("title").strip()
             for match in _QUOTED_TITLE_RE.finditer(title)
         ]
+        parenthesized = [
+            match.group("title").strip()
+            for match in _PAREN_ALIAS_RE.finditer(title)
+        ]
         stripped = _BRACKETED_PREFIX_RE.sub(" ", title).strip()
-        pieces = [*quoted]
+        pieces = [*quoted, *parenthesized]
         if stripped:
             split_pieces = _TITLE_SEPARATOR_RE.split(stripped)
             pieces.extend(split_pieces)
@@ -538,6 +574,23 @@ def derive_query_variants(
             # was found.
             if len(split_pieces) == 1:
                 pieces.append(stripped)
+
+        normalized_pieces = {
+            normalize_search_text(piece)
+            for piece in pieces
+            if normalize_search_text(piece)
+        }
+        has_seed_piece = any(
+            query_norm in piece or piece in query_norm
+            for piece in normalized_pieces
+        )
+        if allow_top_cross_script and not source_relevant:
+            # Cross-script refinement is only trustworthy when a bilingual
+            # title visibly contains the previous alias.  A merely popular top
+            # result must not invent a new song name (the old behaviour could
+            # turn “角色T” into ACAね/Rin音's unrelated “Character”).
+            if len(normalized_pieces) < 2 or not has_seed_piece:
+                continue
 
         for piece in pieces:
             piece = piece.strip(" \t\r\n-—–:：,，!！?？'\"")
@@ -834,10 +887,19 @@ def rank_search_candidates(
             continue
         ranked.append(track)
 
+    match_priority = {
+        "exact": 4,
+        "prefix": 3,
+        "title": 2,
+        "fuzzy": 1,
+        "metadata": 0,
+    }
     ranked.sort(
         key=lambda item: (
-            bool(item.get("search_original")),
             int(item.get("search_score") or 0),
+            item.get("search_match_source") == "request",
+            bool(item.get("search_original")),
+            match_priority.get(str(item.get("search_match") or ""), -1),
             _safe_int(item.get("favorites")),
             _safe_int(item.get("play")),
         ),

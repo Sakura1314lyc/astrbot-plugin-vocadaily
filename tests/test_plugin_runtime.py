@@ -228,6 +228,57 @@ class PluginRuntimeTests(unittest.IsolatedAsyncioTestCase):
         service._search_api.assert_awaited_once()
         service._search_html.assert_awaited_once()
 
+    async def test_daily_history_avoids_recent_song_when_possible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = main.SongDB(Path(directory) / "daily.db")
+            await db.init()
+            await db.add("BV0000000101", 1, "昨天的歌")
+            await db.add("BV0000000102", 2, "今天的新歌")
+
+            song = await db.random({"BV0000000101"})
+            await db.record_daily(song, "今天的新歌")
+            history = await db.recent_daily(14)
+
+        self.assertEqual(song["bvid"], "BV0000000102")
+        self.assertEqual(history[0]["bvid"], "BV0000000102")
+        self.assertEqual(history[0]["query"], "今天的新歌")
+
+    async def test_scheduled_push_sends_title_review_then_video(self):
+        track = {
+            "bvid": "BV1nk9fBTEkE",
+            "title": "角色T (Character T) / 重音teto",
+            "author": "Atenaアテナ",
+            "duration": 182,
+        }
+        context = SimpleNamespace(
+            send_message=AsyncMock(),
+            get_using_provider=lambda _origin: None,
+        )
+        db = SimpleNamespace(
+            recent_daily=AsyncMock(return_value=[]),
+            random=AsyncMock(return_value=track),
+            record_daily=AsyncMock(),
+        )
+        plugin = object.__new__(main.JRSQPlugin)
+        plugin.context = context
+        plugin.db = db
+        plugin.push_config = {
+            "target_umos": ["aiocqhttp:GroupMessage:123"],
+            "recent_history_size": 14,
+        }
+        plugin._bili_chain = AsyncMock(return_value=["VIDEO"])
+        plugin._generate_review = AsyncMock(return_value="合成声部很有张力，我会想再听一遍。")
+
+        with patch.object(main, "MessageChain", side_effect=lambda value: value):
+            await plugin.scheduled_push()
+
+        messages = [call.args[1] for call in context.send_message.await_args_list]
+        self.assertEqual(len(messages), 3)
+        self.assertIn("今日推荐：角色T", messages[0][0].text)
+        self.assertIn("合成声部很有张力", messages[1][0].text)
+        self.assertEqual(messages[2], ["VIDEO"])
+        db.record_daily.assert_awaited_once_with(track, "")
+
     async def test_direct_bvid_bypasses_search(self):
         service = main.BiliMediaService({}, {})
         service.enrich = AsyncMock(

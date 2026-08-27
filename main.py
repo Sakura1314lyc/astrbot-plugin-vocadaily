@@ -120,6 +120,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cron_minute": 0,
         "timezone": "Asia/Shanghai",
         "fallback_search_query": "术曲",
+        "recent_history_size": 14,
         "daily_queries": [
             "千本樱",
             "天ノ弱",
@@ -535,6 +536,17 @@ class SongDB:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_history (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bvid      TEXT    DEFAULT '',
+                    query     TEXT    DEFAULT '',
+                    title     TEXT    NOT NULL,
+                    pushed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             await db.commit()
 
     async def add(
@@ -564,12 +576,52 @@ class SongDB:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def random(self) -> dict[str, Any] | None:
+    async def random(
+        self, exclude_bvids: set[str] | None = None
+    ) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+            excluded = sorted(str(value) for value in (exclude_bvids or set()) if value)
+            if excluded:
+                placeholders = ",".join("?" for _ in excluded)
+                cursor = await db.execute(
+                    f"SELECT * FROM songs WHERE bvid NOT IN ({placeholders}) "
+                    "ORDER BY RANDOM() LIMIT 1",
+                    excluded,
+                )
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
             cursor = await db.execute("SELECT * FROM songs ORDER BY RANDOM() LIMIT 1")
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def recent_daily(self, limit: int = 14) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT bvid, query, title, pushed_at FROM daily_history "
+                "ORDER BY id DESC LIMIT ?",
+                (max(0, int(limit)),),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def record_daily(self, track: dict[str, Any], query: str = "") -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO daily_history (bvid, query, title) VALUES (?, ?, ?)",
+                (
+                    str(track.get("bvid") or ""),
+                    str(query or ""),
+                    str(track.get("title") or query or "未知术曲"),
+                ),
+            )
+            # The table is operational state, not an ever-growing audit log.
+            await db.execute(
+                "DELETE FROM daily_history WHERE id NOT IN "
+                "(SELECT id FROM daily_history ORDER BY id DESC LIMIT 200)"
+            )
+            await db.commit()
 
     async def list_all(
         self, page: int = 1, per_page: int = 10
@@ -2081,7 +2133,7 @@ class JRSQPlugin(Star):
 
     async def _generate_review(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | str,
         query: str,
         track: dict[str, Any],
         source_name: str,
@@ -2089,7 +2141,12 @@ class JRSQPlugin(Star):
         if not self.review_config.get("enabled", True):
             return None
 
-        provider = self.context.get_using_provider(event.unified_msg_origin)
+        origin = (
+            event
+            if isinstance(event, str)
+            else str(event.unified_msg_origin)
+        )
+        provider = self.context.get_using_provider(origin)
         if provider is None:
             logger.info("[jrsq] 当前会话没有可用的大模型，跳过术曲短评")
             return None
@@ -2197,12 +2254,22 @@ class JRSQPlugin(Star):
             logger.warning("[jrsq] 术曲短评生成失败，已跳过: %s", exc)
             return None
 
-    def _pick_daily_query(self) -> str:
+    def _pick_daily_query(self, excluded_queries: set[str] | None = None) -> str:
         queries = [
             str(query).strip()
             for query in (self.push_config.get("daily_queries") or [])
             if str(query).strip()
         ]
+        excluded = {
+            normalize_search_text(value)
+            for value in (excluded_queries or set())
+            if normalize_search_text(value)
+        }
+        fresh_queries = [
+            query for query in queries if normalize_search_text(query) not in excluded
+        ]
+        if fresh_queries:
+            return random.choice(fresh_queries)
         if queries:
             return random.choice(queries)
         return str(
@@ -2506,8 +2573,19 @@ class JRSQPlugin(Star):
         if not targets:
             logger.info("[jrsq] 未绑定推送 UMO，跳过定时推送")
             return
+        history_size = _bounded_int(
+            self.push_config.get("recent_history_size"), 14, 0, 100
+        )
+        recent = await self.db.recent_daily(history_size) if history_size else []
+        excluded_bvids = {
+            str(item.get("bvid") or "") for item in recent if item.get("bvid")
+        }
+        excluded_queries = {
+            str(item.get("query") or "") for item in recent if item.get("query")
+        }
+        selected_query = ""
         try:
-            song = await self.db.random()
+            song = await self.db.random(excluded_bvids)
             if song:
                 components = await self._bili_chain(
                     {
@@ -2515,21 +2593,44 @@ class JRSQPlugin(Star):
                         "source": "bilibili",
                         "url": f"{BILI_VIDEO_BASE}{song['bvid']}",
                     },
-                    "🌞 每日术曲推荐",
                 )
+                track = song
             else:
-                query = self._pick_daily_query()
-                components, _, _ = await self._search_and_build(
-                    query,
+                selected_query = self._pick_daily_query(excluded_queries)
+                components, _, track = await self._search_and_build(
+                    selected_query,
                     "bilibili",
-                    "🌞 每日术曲推荐",
                 )
         except Exception:
             logger.exception("[jrsq] 定时推送视频准备失败，不发送链接")
             return
+        delivered = False
         for umo in targets:
             try:
+                review = await self._generate_review(
+                    umo,
+                    selected_query or str(track.get("title") or "今日推荐"),
+                    track,
+                    "B站",
+                )
+                await self.context.send_message(
+                    umo,
+                    MessageChain(
+                        [Plain(f"今日推荐：{track.get('title', '未知术曲')}")]
+                    ),
+                )
+                await asyncio.sleep(0.5)
+                await self.context.send_message(
+                    umo,
+                    MessageChain(
+                        [Plain(f"💬 {review or '这首先不急着下定论，听完再聊。'}")]
+                    ),
+                )
+                await asyncio.sleep(0.5)
                 await self.context.send_message(umo, MessageChain(components))
+                delivered = True
                 await asyncio.sleep(1)
             except Exception as exc:  # noqa: BLE001 - one target must not block others
                 logger.error("[jrsq] 推送到 %s 失败: %s", umo, _error_text(exc))
+        if delivered:
+            await self.db.record_daily(track, selected_query)

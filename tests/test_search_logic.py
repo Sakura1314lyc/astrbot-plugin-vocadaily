@@ -27,6 +27,13 @@ class SearchLogicTests(unittest.TestCase):
         self.assertEqual(normalize_search_text("千本桜"), "千本樱")
         self.assertEqual(normalize_search_text("強風 オールバック"), "强风オールバック")
 
+    def test_character_t_adds_confirmed_cross_language_aliases(self):
+        variants = derive_request_query_variants("角色T")
+
+        self.assertEqual(variants[0], "角色T")
+        self.assertIn("キャラクターT", variants)
+        self.assertIn("Character T", variants)
+
     def test_parses_duration_without_raising(self):
         self.assertEqual(parse_duration("04:21"), 261)
         self.assertEqual(parse_duration("1:02:03"), 3723)
@@ -185,6 +192,37 @@ class SearchLogicTests(unittest.TestCase):
         }
         ranked = rank_search_candidates([track, track], "少女レイ")
         self.assertEqual(len(ranked), 1)
+
+    def test_character_t_beats_unrelated_official_character_song(self):
+        tracks = [
+            {
+                "bvid": "BV0000000040",
+                "title": "Character / ACAね×Rin音",
+                "author": "电影音乐官方",
+                "tags": ["初音未来", "音乐"],
+                "duration": 302,
+                "copyright": 1,
+            },
+            {
+                "bvid": "BV1nk9fBTEkE",
+                "title": "角色T (Character T) / 重音teto, 重音teto SV",
+                "author": "Atenaアテナ",
+                "tags": ["VOCALOID", "重音テト", "キャラクターT"],
+                "duration": 182,
+                "copyright": 1,
+            },
+        ]
+
+        ranked = rank_search_candidates(
+            tracks,
+            "角色T",
+            query_variants=derive_request_query_variants("角色T"),
+            derived_query_variants=[],
+        )
+
+        self.assertEqual(ranked[0]["bvid"], "BV1nk9fBTEkE")
+        self.assertEqual(ranked[0]["search_match_source"], "request")
+        self.assertNotIn("BV0000000040", [item["bvid"] for item in ranked])
 
     def test_game_and_dance_versions_do_not_beat_original(self):
         tracks = [
@@ -397,11 +435,32 @@ class SearchLogicTests(unittest.TestCase):
             [],
         )
         trusted = derive_query_variants(
-            tracks,
+            [
+                {
+                    "title": (
+                        "アンノウン・マザーグース / Unknown Mother-Goose"
+                    ),
+                    "tags": ["初音ミク", "VOCALOID"],
+                }
+            ],
             "アンノウン・マザーグース",
             allow_top_cross_script=True,
         )
         self.assertIn("Unknown Mother-Goose", trusted)
+
+    def test_cross_script_refinement_rejects_unrelated_single_title(self):
+        variants = derive_query_variants(
+            [
+                {
+                    "title": "Character / ACAね×Rin音",
+                    "tags": ["初音未来", "VOCALOID"],
+                }
+            ],
+            "キャラクターT",
+            allow_top_cross_script=True,
+        )
+
+        self.assertEqual(variants, [])
 
     def test_hand_drawn_derivative_is_rejected(self):
         assessment = assess_candidate(
